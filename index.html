@@ -934,9 +934,202 @@ if (typeof module !== 'undefined') module.exports = CK;
 </script>
 <script>
 /* =====================================================================
+   TavlaNest — long nardy / שש-בש קווקזי (pure, no DOM)
+   Same absolute state as BG: p[24] signed (white +, black −), off[2], bar unused.
+   Each player has a 24-point track: own point 24 = the head (all 15 start
+   there), own 1..6 = home. Both run the same way round the board, heads in
+   opposite corners, so my point i == opponent point ((i+11)%24)+1.
+   Rules: a single checker blocks a point (no hitting) · only one checker may
+   leave the head per turn (first turn with 6-6, 4-4 or 3-3: two) · a wall
+   of 6 consecutive points is illegal unless an opponent checker is already
+   past it · must use as many dice as possible, the larger one if only one ·
+   bear off once all 15 are home · winner scores 1, or 2 (mars) if the loser
+   has borne off nothing.
+   ===================================================================== */
+const LN = (() => {
+  const SH = i => ((i + 11) % 24) + 1;                                   // my point ↔ opponent point (an involution)
+  function newGame() { const p = new Array(24).fill(0); p[23] = 15; p[SH(24) - 1] = -15; return { p, bar: [0, 0], off: [0, 0] }; }
+  const clone = s => ({ p: s.p.slice(), bar: s.bar.slice(), off: s.off.slice() });
+  // white numbering: point i ↔ abs idx i-1 ; black point j ↔ white point SH(j)
+  function persp(s, pl) {
+    const a = new Array(26).fill(0), b = new Array(26).fill(0);
+    for (let i = 1; i <= 24; i++) {
+      const w = s.p[i - 1], bk = s.p[SH(i) - 1];
+      if (pl === 0) { a[i] = w > 0 ? w : 0; b[i] = bk < 0 ? -bk : 0; }
+      else { a[i] = bk < 0 ? -bk : 0; b[i] = w > 0 ? w : 0; }
+    }
+    a[0] = s.off[pl]; b[0] = s.off[1 - pl];
+    return [a, b];
+  }
+  function fromPersp(a, b, pl) {
+    const p = new Array(24).fill(0);
+    const W = pl === 0 ? a : b, B = pl === 0 ? b : a;
+    for (let i = 1; i <= 24; i++) { if (W[i]) p[i - 1] = W[i]; if (B[i]) p[SH(i) - 1] = -B[i]; }
+    const off = [0, 0]; off[pl] = a[0]; off[1 - pl] = b[0];
+    return { p, bar: [0, 0], off };
+  }
+  const opp = i => SH(i);
+
+  // a 6-wall in front of the opponent with none of their checkers past it is illegal
+  function badWall(a, b) {
+    for (let q = 1; q <= 19; q++) {
+      let full = true; for (let k = 0; k < 6; k++) if (!(a[SH(q + k)] > 0)) { full = false; break; }
+      if (!full) continue;
+      let past = b[0] > 0; for (let r = 1; r < q && !past; r++) if (b[r] > 0) past = true;
+      if (!past) return true;
+    }
+    return false;
+  }
+  function step(a, b, s, d, hl) {
+    if (s < 1 || s > 24 || a[s] <= 0) return null;
+    if (s === 24 && hl != null && hl <= 0) return null;
+    const t = s - d, na = a.slice(); let to;
+    if (t >= 1) { if (b[SH(t)] > 0) return null; na[s]--; na[t]++; to = t; }
+    else {
+      for (let i = 7; i <= 24; i++) if (a[i]) return null;
+      if (t < 0) { for (let i = s + 1; i <= 6; i++) if (a[i]) return null; }
+      na[s]--; na[0]++; to = 0;
+    }
+    if (to && badWall(na, b)) return null;
+    return { a: na, b, t: to, hit: false, hl: s === 24 && hl != null ? hl - 1 : hl };
+  }
+  const keyOf = (a, b) => a.join(',') + '|' + b.join(',');
+  const headLimit = (a, d1, d2) => (a[24] === 15 && d1 === d2 && (d1 === 6 || d1 === 4 || d1 === 3)) ? 2 : 1;
+
+  function turns(a, b, d1, d2) {
+    const dice = d1 === d2 ? [d1, d1, d1, d1] : [d1, d2];
+    const res = new Map(), seen = new Set(); let maxLen = 0;
+    function rec(a, b, rem, hl, moves) {
+      const k = keyOf(a, b) + '/' + rem.join('') + hl;
+      if (seen.has(k)) return; seen.add(k);
+      let moved = false; const tried = {};
+      for (let x = 0; x < rem.length; x++) {
+        const d = rem[x]; if (tried[d]) continue; tried[d] = 1;
+        const rest = rem.slice(0, x).concat(rem.slice(x + 1));
+        for (let s = 1; s <= 24; s++) if (a[s]) { const r = step(a, b, s, d, hl); if (r) { moved = true; rec(r.a, r.b, rest, r.hl, moves.concat([[s, r.t, false, d]])); } }
+      }
+      if (!moved) {
+        const L = moves.length; if (L < maxLen) return;
+        if (L > maxLen) { maxLen = L; res.clear(); }
+        const key = keyOf(a, b); if (!res.has(key)) res.set(key, { moves, a, b });
+      }
+    }
+    rec(a, b, dice, headLimit(a, d1, d2), []);
+    let out = [...res.values()];
+    if (maxLen === 1 && d1 !== d2) { const hi = Math.max(d1, d2), big = out.filter(r => r.moves[0][3] === hi); if (big.length) out = big; }
+    if (maxLen === 0) out = [{ moves: [], a, b }];
+    return out;
+  }
+  function maxMoves(a, b, rem, hl, memo) {
+    if (!rem.length) return 0;
+    const k = keyOf(a, b) + '/' + rem.join('') + hl; if (memo.has(k)) return memo.get(k);
+    let best = 0; const tried = {};
+    for (let x = 0; x < rem.length && best < rem.length; x++) {
+      const d = rem[x]; if (tried[d]) continue; tried[d] = 1;
+      const rest = rem.slice(0, x).concat(rem.slice(x + 1));
+      for (let s = 1; s <= 24; s++) if (a[s]) { const r = step(a, b, s, d, hl); if (r) { const v = 1 + maxMoves(r.a, r.b, rest, r.hl, memo); if (v > best) best = v; if (best === rem.length) break; } }
+    }
+    memo.set(k, best); return best;
+  }
+  function turnInfo(s, pl, d1, d2) {
+    const [a, b] = persp(s, pl), dice = d1 === d2 ? [d1, d1, d1, d1] : [d1, d2], hlim = headLimit(a, d1, d2);
+    const need = maxMoves(a, b, dice, hlim, new Map());
+    let onlyDie = null;
+    if (need === 1 && d1 !== d2) {
+      const hi = Math.max(d1, d2), lo = Math.min(d1, d2);
+      let hiOk = false; for (let x = 1; x <= 24 && !hiOk; x++) if (step(a, b, x, hi, hlim)) hiOk = true;
+      onlyDie = hiOk ? hi : lo;
+    }
+    return { dice, need, onlyDie, headLimit: hlim };
+  }
+  function legalSteps(s, pl, rem, stillNeed, onlyDie, hl) {
+    if (stillNeed <= 0) return [];
+    const [a, b] = persp(s, pl), out = [], memo = new Map(), tried = {};
+    for (let x = 0; x < rem.length; x++) {
+      const d = rem[x]; if (tried[d]) continue; tried[d] = 1;
+      if (onlyDie && d !== onlyDie) continue;
+      const rest = rem.slice(0, x).concat(rem.slice(x + 1));
+      for (let src = 1; src <= 24; src++) {
+        const r = step(a, b, src, d, hl); if (!r) continue;
+        if (1 + maxMoves(r.a, r.b, rest, r.hl, memo) < stillNeed) continue;
+        out.push({ from: src, to: r.t, die: d, hit: false });
+      }
+    }
+    return out;
+  }
+  function uiStep(s, pl, from, die, hl) {
+    const [a, b] = persp(s, pl); const r = step(a, b, from, die, hl == null ? 99 : hl); if (!r) return null;
+    return { state: fromPersp(r.a, r.b, pl), to: r.t, hit: false };
+  }
+  function applyMoves(s, pl, moves) {
+    let [a, b] = persp(s, pl); let hl = 99;
+    for (const m of moves) { const r = step(a, b, m[0], m[3], hl); if (!r) return null; a = r.a; b = r.b; hl = r.hl; }
+    return fromPersp(a, b, pl);
+  }
+  const winner = s => s.off[0] === 15 ? 0 : s.off[1] === 15 ? 1 : -1;
+  const winType = (s, w) => s.off[1 - w] > 0 ? 1 : 2;
+  const pip = a => { let t = 0; for (let i = 1; i <= 24; i++) t += i * a[i]; return t; };
+
+  /* ---------- evaluation (mover just moved; opponent to roll) ---------- */
+  const W = { pip: 1, run: 2.2, front: 1.4, head: 1.2, stack: 1.1, spread: 0.8, home: 0.5, oppHead: 2 };
+  // walls: my runs measured along the opponent's path, valued by how many of their checkers still have to cross them
+  function wallScore(a, b, w) {
+    let sc = 0, run = 0;
+    let behind = new Array(26).fill(0); for (let r = 24; r >= 1; r--) behind[r] = (behind[r + 1] || 0) + b[r];  // opp checkers at r..24 (still to pass r)
+    for (let q = 1; q <= 24; q++) {
+      const mine = a[SH(q)] > 0;
+      if (mine) { run++; const still = behind[q + 1] || 0; if (still) sc += w.front * Math.min(still, 6) / 6 + (run >= 2 ? w.run * (run - 1) * Math.min(still, 8) / 8 : 0); }
+      else run = 0;
+    }
+    return sc;
+  }
+  function evalHard(a, b, w) {
+    w = w || W;
+    if (a[0] === 15) return 10000;
+    let sc = (pip(b) - pip(a)) * w.pip;
+    sc += wallScore(a, b, w) - wallScore(b, a, w) * 0.9;
+    sc -= Math.max(0, a[24] - 1) * w.head * (a[24] > 10 ? 1.5 : 1);
+    let pts = 0; for (let i = 1; i <= 23; i++) if (a[i]) { pts++; if (a[i] > 3) sc -= (a[i] - 3) * w.stack; }
+    sc += Math.min(pts, 9) * w.spread;
+    // holding points in the opponent's starting quarter early slows them down
+    let oh = 0; for (let i = 13; i <= 18; i++) if (a[i]) oh++; if (b[24] > 3) sc += oh * w.oppHead;
+    sc += a[0] * w.home;
+    return sc;
+  }
+  function evalSimple(a, b) {
+    if (a[0] === 15) return 10000;
+    let sc = (pip(b) - pip(a)), pts = 0; for (let i = 1; i <= 23; i++) if (a[i]) pts++;
+    return sc + pts * 1.2 - Math.max(0, a[24] - 1) * 0.6 + a[0];
+  }
+  // a "human" who mostly races, avoids the head jam and likes making points in front of the opponent
+  function evalHuman(a, b) {
+    if (a[0] === 15) return 10000;
+    let sc = (pip(b) - pip(a)) * 1.0 - Math.max(0, a[24] - 1) * 1.0;
+    for (let i = 13; i <= 23; i++) if (a[i]) sc += 1.2;
+    for (let i = 1; i <= 23; i++) if (a[i] > 4) sc -= 1.5;
+    return sc + a[0] * 0.8;
+  }
+  const rnd = () => Math.random();
+  function best(list, f) { let bx = list[0], bv = -Infinity; for (const x of list) { const v = f(x); if (v > bv) { bv = v; bx = x; } } return bx; }
+  function choose(s, pl, d1, d2, level, opt) {
+    opt = opt || {};
+    const [a, b] = persp(s, pl), list = turns(a, b, d1, d2);
+    if (list.length === 1) return list[0];
+    if (level === 'easy') { if (rnd() < 0.35) return list[Math.floor(rnd() * list.length)]; return best(list, x => evalSimple(x.a, x.b) + rnd() * 10); }
+    if (level === 'human') return best(list, x => evalHuman(x.a, x.b) + rnd() * 2);
+    if (level === 'medium') return best(list, x => evalSimple(x.a, x.b) + rnd() * 2);
+    return best(list, x => evalHard(x.a, x.b, opt.w));
+  }
+  return { W, SH, opp, newGame, clone, persp, fromPersp, step, turns, maxMoves, turnInfo, legalSteps, uiStep, applyMoves, winner, winType, pip, choose, evalHard, badWall, headLimit };
+})();
+if (typeof module !== 'undefined') module.exports = LN;
+
+</script>
+<script>
+/* =====================================================================
    TavlaNest — שש-בש ודמקה · AppNest
    ===================================================================== */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const STORE_URL = 'https://appnest-store.pages.dev';
 const FEEDBACK = 'appnest55@gmail.com';
 
@@ -959,7 +1152,7 @@ const saveGame = () => { if (G) store.set(K.game, G); else store.del(K.game); };
 /* ---------- i18n ---------- */
 const LANG = {
   he: {
-    appSub: 'שש-בש ודמקה', bg: 'שש-בש', ck: 'דמקה', bgSub: 'מול המחשב, בטלפון אחד או אונליין', ckSub: 'קלאסית ישראלית או אנגלית',
+    appSub: 'שש-בש ודמקה', bg: 'שש-בש', bgLong: 'שש-בש קווקזי', bgShort: 'רגיל', bgLongShort: 'קווקזי (ארוך)', variant: 'סוג', headRule: 'רק כלי אחד יוצא מהראש בכל תור', ck: 'דמקה', bgSub: 'רגיל או קווקזי (ארוך)', ckSub: 'קלאסית ישראלית או אנגלית',
     vsCpu: 'מול המחשב', local: 'שניים בטלפון אחד', online: 'אונליין עם חבר', level: 'רמה', easy: 'קל', medium: 'בינוני', hard: 'קשה', expert: 'מומחה',
     matchLen: 'אורך הסדרה', toPts: 'סדרה עד {n}', pt1: 'משחק בודד', turkish: 'מארס טורקי שווה 3', start: 'התחל', cancel: 'ביטול', close: 'סגור', ok: 'אישור', back: 'בית',
     rules: 'חוקים', rulesIl: 'ישראלית (מלכה עפה)', rulesEn: 'אנגלית (מלכה קצרה)', myColor: 'הצבע שלי', light: 'בהיר', dark: 'כהה', random: 'אקראי',
@@ -988,11 +1181,11 @@ const LANG = {
     g1t: 'ברוך הבא ל-TavlaNest', g1: 'שש-בש ודמקה בקופסה אחת. בוחרים משחק במסך הבית.', g2t: 'שלוש דרכים לשחק', g2: 'מול המחשב בארבע רמות, שניים בטלפון אחד, או אונליין עם חבר דרך קישור.',
     g3t: 'הזזת כלים', g3: 'מקישים על כלי ואז על המקום המסומן — או גוררים אותו באצבע. "בטל" מחזיר צעד עד שמסיימים את התור.', g4t: 'מדברים תוך כדי', g4: 'באונליין יש "החזק ודבר", מיקרופון פתוח, הודעות קוליות ואימוג׳י. הקול עובר ישירות בין הטלפונים.',
     g5t: 'הכל נשמר אצלך', g5: 'משחק פתוח נשמר אוטומטית. בהגדרות יש גיבוי, שחזור, ערכות צבע ושפה.', skip: 'דלג', next: 'הבא', letsPlay: 'יאללה',
-    hostColorNote: 'המארח משחק בבהיר במשחק הראשון, ואחר כך מתחלפים', bgOnlineNote: 'המארח בלבן, האורח בשחור', replayOf: 'ריפליי · {g}', tapContinue: 'הקש להמשך',
+    hostColorNote: 'המארח משחק בבהיר במשחק הראשון, ואחר כך מתחלפים', bgOnlineNote: 'המארח בלבן, האורח בשחור', rulesLn: 'קווקזי', replayOf: 'ריפליי · {g}', tapContinue: 'הקש להמשך',
     rulesTitleBg: 'חוקי שש-בש', rulesTitleCk: 'חוקי דמקה', cubeless: 'משחקים בלי קוביית הכפלה'
   },
   en: {
-    appSub: 'Backgammon & Checkers', bg: 'Backgammon', ck: 'Checkers', bgSub: 'vs computer, one phone or online', ckSub: 'Israeli classic or English rules',
+    appSub: 'Backgammon & Checkers', bg: 'Backgammon', bgLong: 'Long Nardy', bgShort: 'Classic', bgLongShort: 'Long (Nardy)', variant: 'Variant', headRule: 'Only one checker may leave the head each turn', ck: 'Checkers', bgSub: 'Classic or long (nardy)', ckSub: 'Israeli classic or English rules',
     vsCpu: 'vs Computer', local: 'Two on one phone', online: 'Online with a friend', level: 'Level', easy: 'Easy', medium: 'Medium', hard: 'Hard', expert: 'Expert',
     matchLen: 'Match length', toPts: 'To {n}', pt1: 'Single game', turkish: 'Turkish mars counts 3', start: 'Start', cancel: 'Cancel', close: 'Close', ok: 'OK', back: 'Home',
     rules: 'Rules', rulesIl: 'Israeli (flying king)', rulesEn: 'English (short king)', myColor: 'My color', light: 'Light', dark: 'Dark', random: 'Random',
@@ -1021,12 +1214,12 @@ const LANG = {
     g1t: 'Welcome to TavlaNest', g1: 'Backgammon and checkers in one box. Pick a game on the home screen.', g2t: 'Three ways to play', g2: 'Against the computer at four levels, two on one phone, or online with a friend via a link.',
     g3t: 'Moving pieces', g3: 'Tap a piece, then a highlighted spot — or drag it with your finger. "Undo" takes a step back until you end your turn.', g4t: 'Talk while you play', g4: 'Online games have hold-to-talk, open mic, voice messages and emoji. Voice goes directly between the phones.',
     g5t: 'Everything stays with you', g5: 'An open game saves automatically. Settings has backup, restore, themes and language.', skip: 'Skip', next: 'Next', letsPlay: "Let's play",
-    hostColorNote: 'The host plays light in game one, then you alternate', bgOnlineNote: 'Host plays white, guest plays black', replayOf: 'Replay · {g}', tapContinue: 'Tap to continue',
+    hostColorNote: 'The host plays light in game one, then you alternate', bgOnlineNote: 'Host plays white, guest plays black', rulesLn: 'Long nardy', replayOf: 'Replay · {g}', tapContinue: 'Tap to continue',
     rulesTitleBg: 'Backgammon rules', rulesTitleCk: 'Checkers rules', cubeless: 'Played without a doubling cube'
   },
-  ru: { appSub: 'Нарды и шашки', bg: 'Нарды', ck: 'Шашки', vsCpu: 'Против компьютера', local: 'Вдвоём на одном телефоне', online: 'Онлайн с другом', level: 'Уровень', easy: 'Лёгкий', medium: 'Средний', hard: 'Сложный', expert: 'Эксперт', start: 'Начать', cancel: 'Отмена', close: 'Закрыть', back: 'Домой', resume: 'Продолжить', settings: 'Настройки', stats: 'Статистика', about: 'О приложении', guide: 'Гид', replays: 'Повторы', rulesBtn: 'Правила', roll: 'Бросить кости', done: 'Конец хода', undo: 'Отменить', hint: 'Подсказка', yourTurn: 'Ваш ход', youWin: 'Вы победили!', youLose: 'Вы проиграли', draw: 'Ничья', nextGame: 'Следующая партия', home: 'Домой', resign: 'Сдаться', hostRoom: 'Создать комнату', joinRoom: 'Войти по коду', join: 'Войти', ptt: 'Держите и говорите', openMic: 'Открытый микрофон', voiceMsg: 'Голосовое', name: 'Имя', language: 'Язык', theme: 'Тема', sound: 'Звуки', light: 'Светлые', dark: 'Тёмные', you: 'Вы', computer: 'Компьютер', ok: 'ОК', accept: 'Принять', decline: 'Отклонить', skip: 'Пропустить', next: 'Далее', letsPlay: 'Играть' },
-  es: { appSub: 'Backgammon y damas', bg: 'Backgammon', ck: 'Damas', vsCpu: 'Contra la computadora', local: 'Dos en un teléfono', online: 'En línea con un amigo', level: 'Nivel', easy: 'Fácil', medium: 'Medio', hard: 'Difícil', expert: 'Experto', start: 'Empezar', cancel: 'Cancelar', close: 'Cerrar', back: 'Inicio', resume: 'Continuar', settings: 'Ajustes', stats: 'Estadísticas', about: 'Acerca de', guide: 'Guía', replays: 'Repeticiones', rulesBtn: 'Reglas', roll: 'Tirar dados', done: 'Fin del turno', undo: 'Deshacer', hint: 'Pista', yourTurn: 'Tu turno', youWin: '¡Ganaste!', youLose: 'Perdiste', draw: 'Empate', nextGame: 'Siguiente partida', home: 'Inicio', resign: 'Rendirse', hostRoom: 'Crear sala', joinRoom: 'Unirse con código', join: 'Unirse', ptt: 'Mantén para hablar', openMic: 'Micrófono abierto', voiceMsg: 'Mensaje de voz', name: 'Nombre', language: 'Idioma', theme: 'Tema', sound: 'Sonidos', light: 'Claras', dark: 'Oscuras', you: 'Tú', computer: 'Computadora', ok: 'OK', accept: 'Aceptar', decline: 'Rechazar', skip: 'Saltar', next: 'Siguiente', letsPlay: 'Jugar' },
-  ar: { appSub: 'طاولة وداما', bg: 'طاولة', ck: 'داما', vsCpu: 'ضد الحاسوب', local: 'اثنان على هاتف واحد', online: 'أونلاين مع صديق', level: 'المستوى', easy: 'سهل', medium: 'متوسط', hard: 'صعب', expert: 'خبير', start: 'ابدأ', cancel: 'إلغاء', close: 'إغلاق', back: 'الرئيسية', resume: 'متابعة', settings: 'الإعدادات', stats: 'إحصائيات', about: 'حول', guide: 'دليل', replays: 'إعادة', rulesBtn: 'القواعد', roll: 'ارمِ النرد', done: 'إنهاء الدور', undo: 'تراجع', hint: 'تلميح', yourTurn: 'دورك', youWin: 'فزت!', youLose: 'خسرت', draw: 'تعادل', nextGame: 'اللعبة التالية', home: 'الرئيسية', resign: 'انسحاب', hostRoom: 'أنشئ غرفة', joinRoom: 'انضم برمز', join: 'انضم', ptt: 'اضغط وتحدث', openMic: 'ميكروفون مفتوح', voiceMsg: 'رسالة صوتية', name: 'الاسم', language: 'اللغة', theme: 'السمة', sound: 'الأصوات', light: 'فاتح', dark: 'داكن', you: 'أنت', computer: 'الحاسوب', ok: 'حسناً', accept: 'قبول', decline: 'رفض', skip: 'تخطَّ', next: 'التالي', letsPlay: 'هيا نلعب' }
+  ru: { appSub: 'Нарды и шашки', bg: 'Нарды (короткие)', bgLong: 'Длинные нарды', bgShort: 'Короткие', bgLongShort: 'Длинные', ck: 'Шашки', vsCpu: 'Против компьютера', local: 'Вдвоём на одном телефоне', online: 'Онлайн с другом', level: 'Уровень', easy: 'Лёгкий', medium: 'Средний', hard: 'Сложный', expert: 'Эксперт', start: 'Начать', cancel: 'Отмена', close: 'Закрыть', back: 'Домой', resume: 'Продолжить', settings: 'Настройки', stats: 'Статистика', about: 'О приложении', guide: 'Гид', replays: 'Повторы', rulesBtn: 'Правила', roll: 'Бросить кости', done: 'Конец хода', undo: 'Отменить', hint: 'Подсказка', yourTurn: 'Ваш ход', youWin: 'Вы победили!', youLose: 'Вы проиграли', draw: 'Ничья', nextGame: 'Следующая партия', home: 'Домой', resign: 'Сдаться', hostRoom: 'Создать комнату', joinRoom: 'Войти по коду', join: 'Войти', ptt: 'Держите и говорите', openMic: 'Открытый микрофон', voiceMsg: 'Голосовое', name: 'Имя', language: 'Язык', theme: 'Тема', sound: 'Звуки', light: 'Светлые', dark: 'Тёмные', you: 'Вы', computer: 'Компьютер', ok: 'ОК', accept: 'Принять', decline: 'Отклонить', skip: 'Пропустить', next: 'Далее', letsPlay: 'Играть' },
+  es: { appSub: 'Backgammon y damas', bg: 'Backgammon', bgLong: 'Nardy largo', bgShort: 'Clásico', bgLongShort: 'Largo (nardy)', ck: 'Damas', vsCpu: 'Contra la computadora', local: 'Dos en un teléfono', online: 'En línea con un amigo', level: 'Nivel', easy: 'Fácil', medium: 'Medio', hard: 'Difícil', expert: 'Experto', start: 'Empezar', cancel: 'Cancelar', close: 'Cerrar', back: 'Inicio', resume: 'Continuar', settings: 'Ajustes', stats: 'Estadísticas', about: 'Acerca de', guide: 'Guía', replays: 'Repeticiones', rulesBtn: 'Reglas', roll: 'Tirar dados', done: 'Fin del turno', undo: 'Deshacer', hint: 'Pista', yourTurn: 'Tu turno', youWin: '¡Ganaste!', youLose: 'Perdiste', draw: 'Empate', nextGame: 'Siguiente partida', home: 'Inicio', resign: 'Rendirse', hostRoom: 'Crear sala', joinRoom: 'Unirse con código', join: 'Unirse', ptt: 'Mantén para hablar', openMic: 'Micrófono abierto', voiceMsg: 'Mensaje de voz', name: 'Nombre', language: 'Idioma', theme: 'Tema', sound: 'Sonidos', light: 'Claras', dark: 'Oscuras', you: 'Tú', computer: 'Computadora', ok: 'OK', accept: 'Aceptar', decline: 'Rechazar', skip: 'Saltar', next: 'Siguiente', letsPlay: 'Jugar' },
+  ar: { appSub: 'طاولة وداما', bg: 'طاولة', bgLong: 'محبوسة طويلة', bgShort: 'عادية', bgLongShort: 'طويلة', ck: 'داما', vsCpu: 'ضد الحاسوب', local: 'اثنان على هاتف واحد', online: 'أونلاين مع صديق', level: 'المستوى', easy: 'سهل', medium: 'متوسط', hard: 'صعب', expert: 'خبير', start: 'ابدأ', cancel: 'إلغاء', close: 'إغلاق', back: 'الرئيسية', resume: 'متابعة', settings: 'الإعدادات', stats: 'إحصائيات', about: 'حول', guide: 'دليل', replays: 'إعادة', rulesBtn: 'القواعد', roll: 'ارمِ النرد', done: 'إنهاء الدور', undo: 'تراجع', hint: 'تلميح', yourTurn: 'دورك', youWin: 'فزت!', youLose: 'خسرت', draw: 'تعادل', nextGame: 'اللعبة التالية', home: 'الرئيسية', resign: 'انسحاب', hostRoom: 'أنشئ غرفة', joinRoom: 'انضم برمز', join: 'انضم', ptt: 'اضغط وتحدث', openMic: 'ميكروفون مفتوح', voiceMsg: 'رسالة صوتية', name: 'الاسم', language: 'اللغة', theme: 'السمة', sound: 'الأصوات', light: 'فاتح', dark: 'داكن', you: 'أنت', computer: 'الحاسوب', ok: 'حسناً', accept: 'قبول', decline: 'رفض', skip: 'تخطَّ', next: 'التالي', letsPlay: 'هيا نلعب' }
 };
 const LANGS = [['he', 'עברית'], ['en', 'English'], ['ru', 'Русский'], ['es', 'Español'], ['ar', 'العربية']];
 function T(k, v) {
@@ -1150,7 +1343,7 @@ function goHome() {
       <div class="row"><button class="iconbtn" id="hTheme" aria-label="${esc(T('theme'))}">🎨</button><button class="iconbtn" id="hMode" aria-label="${esc(T('dayNight'))}">${ST.mode === 'night' ? '☀️' : '🌙'}</button><span class="grow"></span><button class="iconbtn" id="hAbout" aria-label="${esc(T('about'))}">ℹ️</button></div>
       <div class="brand"><h1>TavlaNest</h1><div class="sub">${T('appSub')}</div></div>
       ${caseArt()}
-      ${live ? `<button class="card resume" id="hResume"><span style="font-size:30px">${G.kind === 'bg' ? '🎲' : '⛀'}</span><span class="grow" style="text-align:start"><b>${T('resume')}</b><span class="muted small">${T('resumeOf', { g: T(G.kind), m: esc(modeName) })}</span></span><span style="font-size:22px">${isRTL() ? '‹' : '›'}</span></button>` : ''}
+      ${live ? `<button class="card resume" id="hResume"><span style="font-size:30px">${G.kind === 'bg' ? '🎲' : '⛀'}</span><span class="grow" style="text-align:start"><b>${T('resume')}</b><span class="muted small">${T('resumeOf', { g: T(G.kind === 'bg' && G.variant === 'long' ? 'bgLong' : G.kind), m: esc(modeName) })}</span></span><span style="font-size:22px">${isRTL() ? '‹' : '›'}</span></button>` : ''}
       <div class="tiles">
         <button class="tile" id="tBg">${tileBg}<b>${T('bg')}</b><span>${T('bgSub')}</span></button>
         <button class="tile" id="tCk">${tileCk}<b>${T('ck')}</b><span>${T('ckSub')}</span></button>
@@ -1175,14 +1368,14 @@ function goHome() {
 const LEVELS = { bg: ['easy', 'medium', 'hard'], ck: ['easy', 'medium', 'hard', 'expert'] };
 function startSheet(kind) {
   let lv0 = store.get('tavla_lastlevel_' + kind, 'medium'); if (!LEVELS[kind].includes(lv0)) lv0 = 'hard';
-  const o = { mode: 'cpu', level: lv0, match: 3, turkish: true, rules: ST.rules, color: '0', p1: ST.name || T('player1'), p2: T('player2') };
+  const o = { mode: 'cpu', level: lv0, match: 3, turkish: true, variant: store.get('tavla_lastvariant', 'short'), rules: ST.rules, color: '0', p1: ST.name || T('player1'), p2: T('player2') };
   const draw = () => {
     const s = sheet(`
       <h3>${T(kind)}</h3>
       ${chips('mode', [['cpu', '🤖 ' + T('vsCpu')], ['local', '👥 ' + T('local')], ['online', '🌐 ' + T('online')]], o.mode)}
       ${o.mode === 'cpu' ? `<div class="lbl">${T('level')}</div>${chips('level', LEVELS[kind].map(l => [l, T(l)]), o.level)}` : ''}
-      ${kind === 'bg' ? `<div class="lbl">${T('matchLen')}</div>${chips('match', [[1, T('pt1')], [3, T('toPts', { n: 3 })], [5, T('toPts', { n: 5 })], [7, T('toPts', { n: 7 })]], o.match)}
-        <div class="setrow"><span>${T('turkish')}</span><button class="tog" id="sTk" aria-pressed="${o.turkish}"></button></div><div class="muted small">${T('cubeless')}</div>` :
+      ${kind === 'bg' ? `<div class="lbl">${T('variant')}</div>${chips('variant', [['short', T('bgShort')], ['long', T('bgLongShort')]], o.variant)}<div class="lbl">${T('matchLen')}</div>${chips('match', [[1, T('pt1')], [3, T('toPts', { n: 3 })], [5, T('toPts', { n: 5 })], [7, T('toPts', { n: 7 })]], o.match)}
+        ${o.variant === 'short' ? `<div class="setrow"><span>${T('turkish')}</span><button class="tog" id="sTk" aria-pressed="${o.turkish}"></button></div>` : ''}<div class="muted small">${T('cubeless')}</div>` :
         `<div class="lbl">${T('rules')}</div>${chips('rules', [['il', T('rulesIl')], ['en', T('rulesEn')]], o.rules)}
         ${o.mode === 'cpu' ? `<div class="lbl">${T('myColor')}</div>${chips('color', [['0', T('light')], ['1', T('dark')], ['r', T('random')]], o.color)}` : ''}`}
       ${o.mode === 'local' ? `<div class="row"><input class="field" id="sP1" maxlength="20" value="${esc(o.p1)}" aria-label="${esc(T('player1'))}"><input class="field" id="sP2" maxlength="20" value="${esc(o.p2)}" aria-label="${esc(T('player2'))}"></div>` : ''}
@@ -1190,7 +1383,7 @@ function startSheet(kind) {
         <button class="btn primary" id="sHost">${T('hostRoom')}</button><button class="btn" id="sJoin">${T('joinRoom')}</button>` :
         `<button class="btn primary" id="sGo">${T('start')}</button>`}
     `);
-    bindChips(s, (k, v) => { if (k === 'match') o[k] = +v; else o[k] = v; if (k === 'mode') { readNames(); draw(); } });
+    bindChips(s, (k, v) => { if (k === 'match') o[k] = +v; else o[k] = v; if (k === 'variant') store.set('tavla_lastvariant', v); if (k === 'mode' || k === 'variant') { readNames(); draw(); } });
     const tk = $('#sTk', s); if (tk) tk.onclick = () => { o.turkish = !o.turkish; tk.setAttribute('aria-pressed', o.turkish); };
     function readNames() { const a = $('#sP1', s), b = $('#sP2', s); if (a) o.p1 = a.value.trim() || T('player1'); if (b) o.p2 = b.value.trim() || T('player2'); }
     const go = $('#sGo', s);
@@ -1213,7 +1406,7 @@ function needName(then) {
 
 function newLocalGame(kind, o) {
   if (kind === 'bg') {
-    G = BGX.create({ mode: o.mode, level: o.level, match: o.match, turkish: o.turkish, names: o.mode === 'cpu' ? [ST.name || T('you'), T('computer')] : [o.p1, o.p2], me: o.mode === 'cpu' ? 0 : null });
+    G = BGX.create({ mode: o.mode, variant: o.variant, level: o.level, match: o.match, turkish: o.turkish, names: o.mode === 'cpu' ? [ST.name || T('you'), T('computer')] : [o.p1, o.p2], me: o.mode === 'cpu' ? 0 : null });
   } else {
     const me = o.mode === 'cpu' ? (o.color === 'r' ? (Math.random() < .5 ? 0 : 1) : +o.color) : null;
     const names = o.mode === 'cpu' ? (me === 0 ? [ST.name || T('you'), T('computer')] : [T('computer'), ST.name || T('you')]) : [o.p1, o.p2];
@@ -1294,16 +1487,21 @@ const BGX = (() => {
   const BW = 400, BH = 340, PW = 164 / 6, R = 12.4, PH = 138;
   let run = 0, sel = null, targets = null, drag = null, anim = null;
   const mir = x => ST.mirror ? BW - x : x;
+  const E = () => (G && G.variant === 'long') ? LN : BG;
+  const isLong = () => !!(G && G.variant === 'long');
+  const oppPt = p => isLong() ? LN.SH(p) : 25 - p;
+  // head-rule budget left this turn (long nardy only; BG ignores it)
+  const hl = () => isLong() ? (G.headLimit || 1) - G.tm.filter(x => x.from === 24).length : undefined;
   const alive = id => id === run && CUR === 'game' && G && G.kind === 'bg';
   function stopTimers() { run++; }
 
   function create(o) {
-    return { kind: 'bg', mode: o.mode, level: o.level, match: o.match, turkish: o.turkish, names: o.names, me: o.me, score: [0, 0], gameNo: 1, hints: 0,
-      phase: 'opening', s: BG.newGame(), turn: 0, dice: null, rem: [], need: 0, onlyDie: null, start: null, tm: [], rec: null, result: null, open: null, net: o.net || null };
+    return { kind: 'bg', variant: o.variant || 'short', mode: o.mode, level: o.level, match: o.match, turkish: o.turkish, names: o.names, me: o.me, score: [0, 0], gameNo: 1, hints: 0,
+      phase: 'opening', s: (o.variant === 'long' ? LN : BG).newGame(), turn: 0, dice: null, rem: [], need: 0, onlyDie: null, start: null, tm: [], rec: null, result: null, open: null, net: o.net || null };
   }
   const vp = () => G.mode === 'local' ? 0 : G.me;                         // whose side is at the bottom
-  const toView = (p, pl) => p === 0 || p === 25 ? p : (pl === vp() ? p : 25 - p);   // mover-perspective point → viewer point
-  const fromView = (p, pl) => p === 0 || p === 25 ? p : (pl === vp() ? p : 25 - p);
+  const toView = (p, pl) => p === 0 || p === 25 ? p : (pl === vp() ? p : oppPt(p));   // mover-perspective point → viewer point
+  const fromView = (p, pl) => p === 0 || p === 25 ? p : (pl === vp() ? p : oppPt(p));
 
   /* ---------- geometry ---------- */
   function ptX(i) { let x; if (i <= 6) x = 196 + (6 - i) * PW + PW / 2; else if (i <= 12) x = 8 + (12 - i) * PW + PW / 2; else if (i <= 18) x = 8 + (i - 13) * PW + PW / 2; else x = 196 + (i - 19) * PW + PW / 2; return mir(x); }
@@ -1321,7 +1519,8 @@ const BGX = (() => {
   function svg(s, o) {
     o = o || {};
     const v = o.vp != null ? o.vp : vp();
-    const [a, b] = BG.persp(s, v);                                      // a = bottom player's checkers (viewer numbering), b = top player (their numbering)
+    const long = o.variant ? o.variant === 'long' : isLong(), EN = long ? LN : BG, op = i => long ? LN.SH(i) : 25 - i;
+    const [a, b] = EN.persp(s, v);                                      // a = bottom player's checkers (viewer numbering), b = top player (their numbering)
     const colA = v === 0 ? 'A' : 'B', colB = v === 0 ? 'B' : 'A';
     let g = `<rect x="0" y="0" width="${BW}" height="${BH}" rx="10" fill="var(--frame)"/>
       <rect x="${Math.min(mir(8), mir(172))}" y="8" width="164" height="${BH - 16}" fill="var(--field)"/><rect x="${Math.min(mir(196), mir(360))}" y="8" width="164" height="${BH - 16}" fill="var(--field)"/>
@@ -1345,7 +1544,7 @@ const BGX = (() => {
     const cnt = (x, y, n, col) => `<text x="${x}" y="${y + 4}" font-size="12" font-weight="700" text-anchor="middle" fill="var(--chk${col}-ink)" pointer-events="none">${n}</text>`;
     const selV = o.sel, mv = o.movable || new Set();
     for (let i = 1; i <= 24; i++) {
-      let n = a[i], col = colA; if (!n) { n = b[25 - i]; col = colB; }
+      let n = a[i], col = colA; if (!n) { n = b[op(i)]; col = colB; }
       if (!n) continue;
       for (let k = 0; k < n; k++) {
         const [x, y] = slotXY(i, k, n);
@@ -1405,7 +1604,7 @@ const BGX = (() => {
     if (G.phase === 'opening' && !G.open) o.dice = null;
     if (G.phase === 'roll') o.dice = null;
     if (human && (G.phase === 'move')) {
-      const steps = BG.legalSteps(G.s, pl, G.rem, G.need - G.tm.length, G.onlyDie);
+      const steps = E().legalSteps(G.s, pl, G.rem, G.need - G.tm.length, G.onlyDie, hl());
       o.movable = new Set(steps.map(x => x.from === 25 ? (pl === vp() ? 'barMe' : 'barOpp') : toView(x.from, pl)));
       if (sel != null) {
         o.sel = sel === 25 ? 25 : toView(sel, pl); o.selSide = pl === vp() ? 'me' : 'opp';
@@ -1421,9 +1620,9 @@ const BGX = (() => {
     const v = vp(), s = G.s, online = G.mode === 'online';
     const col = p => p === 0 ? ['--chkA', '--chkA-rim'] : ['--chkB', '--chkB-rim'];
     for (const [id, p] of [['stripBot', v], ['stripTop', 1 - v]]) {
-      const [a] = BG.persp(s, p), c = col(p);
+      const [a] = E().persp(s, p), c = col(p);
       const ro = online ? NET.rosterFor(p) : null;
-      GS.strip(id, { name: G.names[p], color: c[0], rim: c[1], turn: G.turn === p && !['over', 'matchover', 'opening'].includes(G.phase), meta: ST.pips ? T('pip', { n: N(BG.pip(a)) }) : '', score: G.match > 1 ? G.score[p] : null,
+      GS.strip(id, { name: G.names[p], color: c[0], rim: c[1], turn: G.turn === p && !['over', 'matchover', 'opening'].includes(G.phase), meta: ST.pips ? T('pip', { n: N(E().pip(a)) }) : '', score: G.match > 1 ? G.score[p] : null,
         net: ro && p !== G.me ? ro.online : null, talk: ro && ro.talking });
     }
   }
@@ -1479,9 +1678,9 @@ const BGX = (() => {
     return toView(p, pl);
   }
   function countIn(s, reg) {
-    const [a, b] = BG.persp(s, vp());
+    const [a, b] = E().persp(s, vp());
     if (reg === 'barMe') return a[25]; if (reg === 'barOpp') return b[25]; if (reg === 'offMe') return a[0]; if (reg === 'offOpp') return b[0];
-    return a[reg] || b[25 - reg];
+    return a[reg] || b[oppPt(reg)];
   }
   function stepAnim(before, pl, st) {
     const fr = regionOf(st.from, pl), to = regionOf(st.to, pl);
@@ -1494,7 +1693,7 @@ const BGX = (() => {
   /* ---------- flow ---------- */
   function open() {
     sel = null; targets = null; run++;
-    GS.open(T('bg') + (G.mode === 'cpu' ? ' · ' + T(G.level) : ''), '');
+    GS.open(T(isLong() ? 'bgLong' : 'bg') + (G.mode === 'cpu' ? ' · ' + T(G.level) : ''), '');
     bindBoard(); render(); proceed();
   }
   function proceed() {
@@ -1502,7 +1701,7 @@ const BGX = (() => {
     if (G.phase === 'opening') { if (G.mode !== 'online' || NET.isHost()) doOpening(id); return; }
     if (G.phase === 'roll') { if (ctl === 'cpu') cpuTurn(id); else if (ctl === 'human' && ST.autoRoll) setTimeout(() => { if (alive(id) && G.phase === 'roll') humanRoll(); }, 450); return; }
     if (G.phase === 'move' || G.phase === 'confirm') {
-      if (ctl === 'cpu') { G.s = BG.clone(G.start); G.tm = []; G.rem = G.dice[0] === G.dice[1] ? [G.dice[0], G.dice[0], G.dice[0], G.dice[0]] : G.dice.slice(); cpuPlay(id); }
+      if (ctl === 'cpu') { G.s = E().clone(G.start); G.tm = []; G.rem = G.dice[0] === G.dice[1] ? [G.dice[0], G.dice[0], G.dice[0], G.dice[0]] : G.dice.slice(); cpuPlay(id); }
       else if (ctl === 'human' && G.need === 0) passAfter(id);
       return;
     }
@@ -1522,13 +1721,13 @@ const BGX = (() => {
   async function applyOpening(d, id) {
     G.open = d; const st = d[0] > d[1] ? 0 : 1;
     G.openMsg = T('openWin', { n: esc(G.names[st]), a: N(Math.max(...d)), b: N(Math.min(...d)) });
-    G.s = BG.newGame(); G.turn = st; G.rec = { open: d.slice(), turns: [] }; G.lastTrail = null; saveGame();
+    G.s = E().newGame(); G.turn = st; G.rec = { open: d.slice(), turns: [] }; G.lastTrail = null; saveGame();
     render(); await wait(1100); if (!alive(id) && id !== -1) return;
     beginMove([Math.max(...d), Math.min(...d)]);
   }
   function beginMove(d) {
-    const info = BG.turnInfo(G.s, G.turn, d[0], d[1]);
-    G.dice = d.slice(); G.rem = info.dice.slice(); G.need = info.need; G.onlyDie = info.onlyDie; G.start = BG.clone(G.s); G.tm = []; G.phase = 'move'; G.open = null;
+    const info = E().turnInfo(G.s, G.turn, d[0], d[1]);
+    G.headLimit = info.headLimit || 1; G.dice = d.slice(); G.rem = info.dice.slice(); G.need = info.need; G.onlyDie = info.onlyDie; G.start = E().clone(G.s); G.tm = []; G.phase = 'move'; G.open = null;
     sel = null; targets = null; saveGame(); render();
     const id = run, ctl = controllerOf(G.turn);
     if (ctl === 'cpu') cpuPlay(id);
@@ -1552,7 +1751,7 @@ const BGX = (() => {
   async function cpuPlay(id) {
     if (G.need === 0) { await wait(1300); if (!alive(id)) return; return commit(); }
     await wait(350); if (!alive(id)) return;
-    const ch = BG.choose(G.s, G.turn, G.dice[0], G.dice[1], G.level);
+    const ch = E().choose(G.s, G.turn, G.dice[0], G.dice[1], G.level);
     for (const m of ch.moves) {
       await wait(430); if (!alive(id)) return;
       doStep({ from: m[0], die: m[3], to: m[1], hit: m[2] });
@@ -1561,13 +1760,13 @@ const BGX = (() => {
     commit();
   }
   function doStep(st) {
-    const before = G.s, pl = G.turn, r = BG.uiStep(G.s, pl, st.from, st.die);
+    const before = G.s, pl = G.turn, r = E().uiStep(G.s, pl, st.from, st.die, hl());
     if (!r) return false;
     G.s = r.state; G.tm.push({ from: st.from, die: st.die, to: r.to, hit: r.hit });
     G.rem.splice(G.rem.indexOf(st.die), 1);
     snd(r.hit ? 'hit' : 'move'); if (r.hit) vib(25);
     const left = G.need - G.tm.length;
-    if (left <= 0 || !BG.legalSteps(G.s, pl, G.rem, left, G.onlyDie).length) G.phase = 'confirm';
+    if (left <= 0 || !E().legalSteps(G.s, pl, G.rem, left, G.onlyDie, hl()).length) G.phase = 'confirm';
     render({ anim: stepAnim(before, pl, { from: st.from, to: r.to, hit: r.hit }) });
     saveGame();
     return true;
@@ -1588,24 +1787,24 @@ const BGX = (() => {
     if (G.mode === 'online') NET.send({ type: 'steps', m: G.tm.map(x => [x.from, x.die]) });
   }
   function replayTurn() {
-    let s = BG.clone(G.start); const tm = G.tm; G.tm = [];
+    let s = E().clone(G.start); const tm = G.tm; G.tm = [];
     G.rem = G.dice[0] === G.dice[1] ? [G.dice[0], G.dice[0], G.dice[0], G.dice[0]] : G.dice.slice();
-    for (const x of tm) { const r = BG.uiStep(s, G.turn, x.from, x.die); if (!r) break; s = r.state; G.tm.push({ from: x.from, die: x.die, to: r.to, hit: r.hit }); G.rem.splice(G.rem.indexOf(x.die), 1); }
+    for (const x of tm) { const h = isLong() ? (G.headLimit || 1) - G.tm.filter(y => y.from === 24).length : undefined; const r = E().uiStep(s, G.turn, x.from, x.die, h); if (!r) break; s = r.state; G.tm.push({ from: x.from, die: x.die, to: r.to, hit: r.hit }); G.rem.splice(G.rem.indexOf(x.die), 1); }
     G.s = s;
   }
   function hint() {
     if (G.phase !== 'move' || controllerOf(G.turn) !== 'human') return;
     if (G.tm.length) { G.tm = []; replayTurn(); }
     G.hints++;
-    const ch = BG.choose(G.s, G.turn, G.dice[0], G.dice[1], 'hard');
+    const ch = E().choose(G.s, G.turn, G.dice[0], G.dice[1], 'hard');
     humanStepPath(ch.moves.map(m => ({ from: m[0], die: m[3], to: m[1], hit: m[2] })));
   }
   function commitHuman() { if (controllerOf(G.turn) !== 'human') return; if (G.mode === 'online') NET.send({ type: 'turn', d: G.dice, m: G.tm.map(x => [x.from, x.die]), h: hashState(G.s) }); commit(); }
   function commit() {
     G.rec.turns.push({ p: G.turn, d: G.dice.slice(), m: G.tm.map(x => [x.from, x.die]) });
     G.lastTrail = G.tm.map(x => [toView(x.from, G.turn), toView(x.to, G.turn)]);
-    const w = BG.winner(G.s);
-    if (w >= 0) return gameOver(w, BG.winType(G.s, w, G.turkish));
+    const w = E().winner(G.s);
+    if (w >= 0) return gameOver(w, E().winType(G.s, w, G.turkish));
     G.turn = 1 - G.turn; G.phase = 'roll'; G.dice = null; G.rem = []; G.tm = []; sel = null; targets = null;
     saveGame(); render(); proceed();
   }
@@ -1617,7 +1816,7 @@ const BGX = (() => {
     const done = G.score[w] >= G.match;
     G.phase = done ? 'matchover' : 'over'; G.dice = null; sel = null;
     // stats + replay
-    if (G.mode === 'cpu') { const L = STATS.bg.cpu[G.level] = STATS.bg.cpu[G.level] || { w: 0, l: 0 }; if (w === G.me) { L.w++; if (type >= 2) STATS.bg.mars++; } else L.l++; if (done && G.match > 1) STATS.bg.matches[w === G.me ? 'w' : 'l']++; }
+    if (G.mode === 'cpu') { const lk = (isLong() ? 'L-' : '') + G.level, L = STATS.bg.cpu[lk] = STATS.bg.cpu[lk] || { w: 0, l: 0 }; if (w === G.me) { L.w++; if (type >= 2) STATS.bg.mars++; } else L.l++; if (done && G.match > 1) STATS.bg.matches[w === G.me ? 'w' : 'l']++; }
     else if (G.mode === 'local') STATS.bg.local++;
     else { STATS.bg.online[w === G.me ? 'w' : 'l']++; if (w === G.me && type >= 2) STATS.bg.mars++; if (done && G.match > 1) STATS.bg.matches[w === G.me ? 'w' : 'l']++; }
     saveStats(); saveReplay();
@@ -1627,18 +1826,18 @@ const BGX = (() => {
   }
   function saveReplay() {
     const list = store.get(K.rep, []);
-    list.unshift({ kind: 'bg', date: Date.now(), names: G.names.slice(), mode: G.mode, level: G.level, open: G.rec ? G.rec.open : null, turns: G.rec ? G.rec.turns : [], result: G.result, me: G.me, hints: G.hints });
+    list.unshift({ kind: 'bg', variant: G.variant || 'short', date: Date.now(), names: G.names.slice(), mode: G.mode, level: G.level, open: G.rec ? G.rec.open : null, turns: G.rec ? G.rec.turns : [], result: G.result, me: G.me, hints: G.hints });
     store.set(K.rep, list.slice(0, 10));
   }
   function resign() {
     if (G.mode === 'online') NET.send({ type: 'resign' });
     const loser = G.mode === 'local' ? G.turn : G.me, w = 1 - loser;
-    run++; gameOver(w, BG.winType(G.s, w, G.turkish), true);
+    run++; gameOver(w, E().winType(G.s, w, G.turkish), true);
   }
   function nextGame(fromNet) {
     if (G.phase !== 'over') return;
     if (G.mode === 'online' && !NET.isHost()) { if (!fromNet) { NET.send({ type: 'next' }); GS.msg(T('waitHost')); } return; }
-    G.gameNo++; G.phase = 'opening'; G.result = null; G.s = BG.newGame(); G.open = null; G.hints = 0; G.lastTrail = null; G.dice = null; saveGame();
+    G.gameNo++; G.phase = 'opening'; G.result = null; G.s = E().newGame(); G.open = null; G.hints = 0; G.lastTrail = null; G.dice = null; saveGame();
     run++; render(); proceed();
   }
   function newMatch(fromNet) {
@@ -1659,18 +1858,18 @@ const BGX = (() => {
   }
   function computeTargets(src) {
     const pl = G.turn, res = new Map();
-    const rec = (s, from, rem, need, path) => {
-      const steps = BG.legalSteps(s, pl, rem, need, G.onlyDie).filter(x => x.from === from).sort((p, q) => p.die - q.die);
+    const rec = (s, from, rem, need, path, h) => {
+      const steps = E().legalSteps(s, pl, rem, need, G.onlyDie, h).filter(x => x.from === from).sort((p, q) => p.die - q.die);
       for (const st of steps) {
         const np = path.concat([st]);
         if (!res.has(st.to) || res.get(st.to).length > np.length) res.set(st.to, np);
         if (st.to !== 0 && need - 1 > 0) {
-          const ns = BG.uiStep(s, pl, from, st.die).state, rr = rem.slice(); rr.splice(rr.indexOf(st.die), 1);
-          rec(ns, st.to, rr, need - 1, np);
+          const ns = E().uiStep(s, pl, from, st.die, h).state, rr = rem.slice(); rr.splice(rr.indexOf(st.die), 1);
+          rec(ns, st.to, rr, need - 1, np, h != null && from === 24 ? h - 1 : h);
         }
       }
     };
-    rec(G.s, src, G.rem, G.need - G.tm.length, []);
+    rec(G.s, src, G.rem, G.need - G.tm.length, [], hl());
     return res;
   }
   function moverPoint(region) {
@@ -1685,10 +1884,11 @@ const BGX = (() => {
     if (G.phase !== 'move' || region == null) return;
     const p = moverPoint(region);
     if (sel != null && targets && targets.has(p)) { humanStepPath(targets.get(p)); return; }
-    const [a] = BG.persp(G.s, pl);
+    const [a] = E().persp(G.s, pl);
     if (p >= 1 && a[p] > 0 || p === 25 && a[25] > 0) {
       const t = computeTargets(p);
       if (t.size) { if (sel === p) { sel = null; targets = null; } else { sel = p; targets = t; } vib(8); render(); return; }
+      if (isLong() && p === 24 && hl() <= 0) toast(T('headRule'));
     }
     if (sel != null) { sel = null; targets = null; render(); }
   }
@@ -1705,7 +1905,7 @@ const BGX = (() => {
       if (!drag || drag.id !== e.pointerId) return;
       if (!drag.on && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 10) {
         if (G.phase !== 'move' || controllerOf(G.turn) !== 'human') return;
-        const p = moverPoint(drag.reg), [a] = BG.persp(G.s, G.turn);
+        const p = moverPoint(drag.reg), [a] = E().persp(G.s, G.turn);
         if (!((p >= 1 && p <= 24 && a[p] > 0) || (p === 25 && a[25] > 0))) return;
         const t = computeTargets(p); if (!t.size) return;
         sel = p; targets = t; drag.on = true; render();
@@ -1740,17 +1940,17 @@ const BGX = (() => {
     }
     if (m.type === 'turn') {
       if (controllerOf(G.turn) !== 'remote') return;
-      if (G.phase === 'roll' || !G.start) { G.start = BG.clone(G.s); const info = BG.turnInfo(G.s, G.turn, m.d[0], m.d[1]); G.dice = m.d; G.need = info.need; G.onlyDie = info.onlyDie; }
+      if (G.phase === 'roll' || !G.start) { G.start = E().clone(G.s); const info = E().turnInfo(G.s, G.turn, m.d[0], m.d[1]); G.headLimit = info.headLimit || 1; G.dice = m.d; G.need = info.need; G.onlyDie = info.onlyDie; }
       G.tm = m.m.map(([from, die]) => ({ from, die })); replayTurn();
       if (m.h && hashState(G.s) !== m.h) { NET.send({ type: 'needstate' }); return; }
       commit(); return;
     }
-    if (m.type === 'resign') { run++; gameOver(G.me, BG.winType(G.s, G.me, G.turkish), true); return; }
+    if (m.type === 'resign') { run++; gameOver(G.me, E().winType(G.s, G.me, G.turkish), true); return; }
     if (m.type === 'next') { if (NET.isHost()) { if (G.phase === 'over') nextGame(true); else if (G.phase === 'matchover') newMatch(true); } return; }
     if (m.type === 'needstate') { NET.send({ type: 'state', g: snapshot() }); return; }
     if (m.type === 'state') { Object.assign(G, m.g); sel = null; targets = null; run++; saveGame(); render(); proceed(); return; }
   }
-  function snapshot() { const g = {}; for (const k of ['score', 'gameNo', 'phase', 's', 'turn', 'dice', 'rem', 'need', 'onlyDie', 'start', 'tm', 'rec', 'result']) g[k] = JSON.parse(JSON.stringify(G[k] == null ? null : G[k])); return g; }
+  function snapshot() { const g = {}; for (const k of ['score', 'gameNo', 'phase', 's', 'turn', 'dice', 'rem', 'need', 'onlyDie', 'headLimit', 'start', 'tm', 'rec', 'result']) g[k] = JSON.parse(JSON.stringify(G[k] == null ? null : G[k])); return g; }
 
   return { create, open, render, onNet, svg, resign, stopTimers, proceed, get sel() { return sel; } };
 })();
@@ -2068,7 +2268,7 @@ const NET = (() => {
   /* ---------- host / join ---------- */
   function host(kind, o) {
     leaveQuiet();
-    G = { kind, mode: 'online', phase: 'lobby', cfg: { kind, match: o.match, turkish: o.turkish, rules: o.rules }, net: { role: 'host' } };
+    G = { kind, mode: 'online', phase: 'lobby', cfg: { kind, variant: o.variant, match: o.match, turkish: o.turkish, rules: o.rules }, net: { role: 'host' } };
     saveGame(); make().host(); showLobby();
   }
   function join(code) {
@@ -2087,7 +2287,7 @@ const NET = (() => {
     if (G.phase === 'lobby') {
       const c = G.cfg;
       const guestName = (LINK.roster.find(p => p.seat === 1) || {}).name || T('friend');
-      if (c.kind === 'bg') G = Object.assign(BGX.create({ mode: 'online', match: c.match, turkish: c.turkish, names: [me, guestName], me: 0 }), { net: G.net });
+      if (c.kind === 'bg') G = Object.assign(BGX.create({ mode: 'online', variant: c.variant, match: c.match, turkish: c.turkish, names: [me, guestName], me: 0 }), { net: G.net });
       else G = Object.assign(CKX.create({ mode: 'online', rules: c.rules, names: [me, guestName], me: 0 }), { net: G.net });
       saveGame();
       LINK.send({ type: 'setup', kind: c.kind, cfg: c, names: [me, guestName] });
@@ -2100,7 +2300,7 @@ const NET = (() => {
       if (isHost()) return;
       const net = G && G.net || { role: 'guest' };
       const c = m.cfg, names = m.names.slice(); names[1] = ST.name || names[1];
-      if (m.kind === 'bg') G = Object.assign(BGX.create({ mode: 'online', match: c.match, turkish: c.turkish, names, me: 1 }), { net });
+      if (m.kind === 'bg') G = Object.assign(BGX.create({ mode: 'online', variant: c.variant, match: c.match, turkish: c.turkish, names, me: 1 }), { net });
       else G = Object.assign(CKX.create({ mode: 'online', rules: c.rules, names, me: 1 }), { net });
       saveGame(); openGame(); return;
     }
@@ -2157,7 +2357,7 @@ function showLobby() {
   show('lobby', w => {
     const L = NET.link, code = L && L.session ? L.session.code : '', hostMode = G && G.net && G.net.role === 'host';
     const url = L ? L.inviteURL() : '';
-    const gname = G && (G.cfg ? T(G.cfg.kind) : T('appSub'));
+    const gname = G && (G.cfg ? T(G.cfg.kind === 'bg' && G.cfg.variant === 'long' ? 'bgLong' : G.cfg.kind) : T('appSub'));
     w.innerHTML = `${topbar(T('online'))}
       <div class="card" style="display:flex;flex-direction:column;gap:12px;text-align:center">
         ${hostMode ? `<div class="muted">${T('roomCode')}</div><div class="code">${esc(code || '·····')}</div>
@@ -2234,6 +2434,7 @@ function showStats() {
   show('stats', w => {
     const lv = ['easy', 'medium', 'hard', 'expert'];
     const bgRows = LEVELS.bg.map(l => { const x = STATS.bg.cpu[l] || { w: 0, l: 0 }; return `<span>${T(l)}</span><span>${N(x.w)}</span><span>${N(x.l)}</span><span class="muted">${x.w + x.l ? N(Math.round(100 * x.w / (x.w + x.l)) + '%') : '–'}</span>`; }).join('');
+    const lnRows = LEVELS.bg.map(l => { const x = STATS.bg.cpu['L-' + l] || { w: 0, l: 0 }; return `<span>${T(l)}</span><span>${N(x.w)}</span><span>${N(x.l)}</span><span class="muted">${x.w + x.l ? N(Math.round(100 * x.w / (x.w + x.l)) + '%') : '–'}</span>`; }).join('');
     const ckRows = lv.map(l => { const x = STATS.ck.cpu[l] || { w: 0, l: 0, d: 0 }; return `<span>${T(l)}</span><span>${N(x.w)}</span><span>${N(x.l)}</span><span>${N(x.d)}</span>`; }).join('');
     w.innerHTML = `${topbar(T('stats'))}
       <div class="card"><h3 style="font-size:22px;margin-bottom:10px">🎲 ${T('statsBg')} · ${T('vsCpu')}</h3>
@@ -2242,6 +2443,8 @@ function showStats() {
         <div class="setrow"><span>${T('matchesWon')}</span><b>${N(STATS.bg.matches.w + ' / ' + (STATS.bg.matches.w + STATS.bg.matches.l))}</b></div>
         <div class="setrow"><span>${T('onlineGames')}</span><b>${N(STATS.bg.online.w + ' : ' + STATS.bg.online.l)}</b></div>
         <div class="setrow"><span>${T('localGames')}</span><b>${N(STATS.bg.local)}</b></div></div>
+      <div class="card"><h3 style="font-size:22px;margin-bottom:10px">🎲 ${T('bgLong')} · ${T('vsCpu')}</h3>
+        <div class="stat"><span class="h">${T('level')}</span><span class="h">${T('wins')}</span><span class="h">${T('losses')}</span><span class="h">%</span>${lnRows}</div></div>
       <div class="card"><h3 style="font-size:22px;margin-bottom:10px">⛀ ${T('statsCk')} · ${T('vsCpu')}</h3>
         <div class="stat"><span class="h">${T('level')}</span><span class="h">${T('wins')}</span><span class="h">${T('losses')}</span><span class="h">${T('draws')}</span>${ckRows}</div>
         <div class="setrow"><span>${T('onlineGames')}</span><b>${N(STATS.ck.online.w + ' : ' + STATS.ck.online.l + ' : ' + STATS.ck.online.d)}</b></div>
@@ -2261,7 +2464,14 @@ const RULES = {
       <h3>אכילה — חובה</h3><ul><li>קופצים מעל כלי יריב צמוד אל משבצת ריקה מאחוריו. אם אפשר להמשיך לקפוץ — ממשיכים באותו תור.</li><li>אם יש אכילה — חובה לאכול (אפשר לבחור איזו). הכלים שחייבים לאכול מסומנים באדום.</li></ul>
       <h3>ישראלית (מלכה עפה)</h3><ul><li>כלי רגיל אוכל גם אחורה.</li><li>מלך עף כמה משבצות שרוצה באלכסון, ואוכל מרחוק.</li><li>כלי שמגיע לשורה האחרונה באמצע אכילה — הופך למלך וממשיך לאכול כמלך.</li></ul>
       <h3>אנגלית (מלכה קצרה)</h3><ul><li>כלי רגיל אוכל רק קדימה.</li><li>מלך זז ואוכל משבצת אחת לכל כיוון.</li><li>הגעה לשורה האחרונה מסיימת את התור.</li></ul>
-      <h3>תיקו</h3><p>25 מהלכים לכל צד בלי אכילה ובלי תזוזת כלי רגיל, או אותו מצב 3 פעמים — תיקו. אפשר גם להציע תיקו.</p>`
+      <h3>תיקו</h3><p>25 מהלכים לכל צד בלי אכילה ובלי תזוזת כלי רגיל, או אותו מצב 3 פעמים — תיקו. אפשר גם להציע תיקו.</p>`,
+    ln: `<h3>המטרה</h3><p>להוציא ראשון את כל 15 הכלים מהלוח.</p>
+      <h3>פתיחה</h3><p>כל 15 הכלים של כל שחקן מתחילים בערימה אחת — "הראש" — בפינה. הראשים בפינות מנוגדות, ושני השחקנים מסתובבים סביב הלוח באותו כיוון: כל אחד עושה סיבוב שלם עד הבית שלו.</p>
+      <h3>בלי אכילות</h3><p>כלי אחד של היריב מספיק כדי לחסום משולש — אסור לנחות עליו. אין בר ואין אכילה.</p>
+      <h3>חוק הראש</h3><p>רק כלי אחד יוצא מהראש בכל תור. יוצא מן הכלל: בתור הראשון של כל שחקן, עם 6–6, 4–4 או 3–3, מותר להוציא שניים (אחרת אי אפשר לשחק את הדאבל).</p>
+      <h3>חומה</h3><p>אסור לבנות 6 משולשים רצופים מול היריב אם אף כלי שלו עוד לא עבר אותם.</p>
+      <h3>תור</h3><ul><li>שתי קוביות; דאבל = ארבעה מהלכים.</li><li>חובה לשחק כמה שיותר מהקוביות. אם אפשר רק אחת — חובה את הגבוהה.</li></ul>
+      <h3>הוצאה וניקוד</h3><p>כשכל 15 הכלים בבית — מוציאים, כמו בשש-בש רגיל. ניצחון = נקודה; מארס (ליריב לא יצא אף כלי) = 2 נקודות.</p>`
   },
   en: {
     bg: `<h3>Goal</h3><p>Be the first to bear off all 15 of your checkers. White moves counter-clockwise toward the home board at the bottom right; black moves the other way.</p>
@@ -2274,16 +2484,23 @@ const RULES = {
       <h3>Capturing is mandatory</h3><ul><li>Jump an adjacent opposing piece onto the empty square behind it. If another jump is available, keep jumping in the same turn.</li><li>If any capture is available you must capture (you may choose which). Pieces that must capture are marked in red.</li></ul>
       <h3>Israeli (flying king)</h3><ul><li>Men also capture backwards.</li><li>Kings fly any distance diagonally and capture from afar.</li><li>A man reaching the far row mid-capture becomes a king and keeps capturing as a king.</li></ul>
       <h3>English (short king)</h3><ul><li>Men capture forward only.</li><li>Kings move and capture one square in any direction.</li><li>Reaching the far row ends the move.</li></ul>
-      <h3>Draws</h3><p>25 moves each with no capture and no man moved, or the same position three times, is a draw. You can also offer a draw.</p>`
+      <h3>Draws</h3><p>25 moves each with no capture and no man moved, or the same position three times, is a draw. You can also offer a draw.</p>`,
+    ln: `<h3>Goal</h3><p>Be the first to bear off all 15 checkers.</p>
+      <h3>Start</h3><p>All 15 checkers of each player start on one point — the "head" — in a corner. The heads are in opposite corners and both players travel the same way round the board, each making a full circuit to their own home.</p>
+      <h3>No hitting</h3><p>A single opposing checker blocks a point; you may not land there. There is no bar.</p>
+      <h3>Head rule</h3><p>Only one checker may leave the head per turn. Exception: on a player's first turn, 6–6, 4–4 or 3–3 lets two leave (otherwise the double could not be played).</p>
+      <h3>Walls</h3><p>You may not build 6 points in a row in front of your opponent unless at least one of their checkers is already past it.</p>
+      <h3>A turn</h3><ul><li>Two dice; doubles give four moves.</li><li>Use as many dice as possible; if only one can be used, it must be the higher.</li></ul>
+      <h3>Bearing off and scoring</h3><p>Once all 15 are home, bear off as in classic backgammon. A win is 1 point; mars (opponent bore off nothing) is 2.</p>`
   }
 };
 function showRules(kind, fromGame) {
-  let k = kind || 'bg';
+  let k = kind === 'bg' && G && G.variant === 'long' ? 'ln' : (kind || 'bg');
   const lang = RULES[ST.lang] ? ST.lang : 'en';
   show('rules', w => {
     const paint = () => {
       w.innerHTML = `<div class="topbar"><button class="btn quiet back" id="rBack">${isRTL() ? '→' : '←'} ${T('back')}</button><h2>${T('rulesBtn')}</h2><span style="width:88px"></span></div>
-        ${chips('k', [['bg', T('bg')], ['ck', T('ck')]], k)}
+        ${chips('k', [['bg', T('bg')], ['ln', T('bgLong')], ['ck', T('ck')]], k)}
         <div class="card prose">${RULES[lang][k]}</div>`;
       bindChips(w, (_, v) => { k = v; paint(); });
       $('#rBack').onclick = () => fromGame && G ? openGame() : goHome();
@@ -2325,7 +2542,7 @@ function showReplays() {
   const list = store.get(K.rep, []);
   show('replays', w => {
     w.innerHTML = `${topbar(T('replays'))}
-      ${list.length ? `<div class="list">${list.map((r, i) => { const res = r.result ? (r.result.w === 2 ? T('draw') : esc(r.names[r.result.w]) + ' 🏆') : ''; return `<button class="card resume" data-i="${i}"><span style="font-size:26px">${r.kind === 'bg' ? '🎲' : '⛀'}</span><span class="grow" style="text-align:start"><b>${esc(r.names[0])} – ${esc(r.names[1])}</b><span class="muted small">${T(r.kind)} · ${N(new Date(r.date).toLocaleDateString())} · ${res}</span></span></button>`; }).join('')}</div>` : `<div class="card muted">${T('noReplays')}</div>`}`;
+      ${list.length ? `<div class="list">${list.map((r, i) => { const res = r.result ? (r.result.w === 2 ? T('draw') : esc(r.names[r.result.w]) + ' 🏆') : ''; return `<button class="card resume" data-i="${i}"><span style="font-size:26px">${r.kind === 'bg' ? '🎲' : '⛀'}</span><span class="grow" style="text-align:start"><b>${esc(r.names[0])} – ${esc(r.names[1])}</b><span class="muted small">${T(r.kind === 'bg' && r.variant === 'long' ? 'bgLong' : r.kind)} · ${N(new Date(r.date).toLocaleDateString())} · ${res}</span></span></button>`; }).join('')}</div>` : `<div class="card muted">${T('noReplays')}</div>`}`;
     $$('[data-i]', w).forEach(b => b.onclick = () => replayView(list[+b.dataset.i]));
   });
 }
@@ -2333,21 +2550,22 @@ function replayView(r) {
   // rebuild every position from the start + move list
   const frames = [];
   if (r.kind === 'bg') {
-    let s = BG.newGame(); frames.push({ s, d: r.open, side: 'open' });
-    for (const t of r.turns || []) { let x = s; for (const [from, die] of t.m) { const q = BG.uiStep(x, t.p, from, die); if (!q) break; x = q.state; } s = x; frames.push({ s, d: t.d, side: t.p }); }
+    const EN = r.variant === 'long' ? LN : BG;
+    let s = EN.newGame(); frames.push({ s, d: r.open, side: 'open' });
+    for (const t of r.turns || []) { let x = s; for (const [from, die] of t.m) { const q = EN.uiStep(x, t.p, from, die); if (!q) break; x = q.state; } s = x; frames.push({ s, d: t.d, side: t.p }); }
   } else {
     let st = CK.newGame(); frames.push({ b: st.b });
     for (const p of r.moves || []) { const mv = CK.moves(st.b, st.turn, r.rules).find(m => m.path.length === p.length && m.path.every((q, i) => q === p[i])); if (!mv) break; st = CK.play(st, mv, r.rules); frames.push({ b: st.b, last: { path: p } }); }
   }
   let i = 0, timer = null;
   show('replay', w => {
-    w.innerHTML = `${topbar(T('replayOf', { g: T(r.kind) }))}<div class="muted" style="text-align:center">${esc(r.names[0])} – ${esc(r.names[1])}</div><div class="boardbox" id="rpB"></div>
+    w.innerHTML = `${topbar(T('replayOf', { g: T(r.kind === 'bg' && r.variant === 'long' ? 'bgLong' : r.kind) }))}<div class="muted" style="text-align:center">${esc(r.names[0])} – ${esc(r.names[1])}</div><div class="boardbox" id="rpB"></div>
       <div class="msg" id="rpM"></div><div class="actions"><button class="btn quiet" id="rp0">⏮</button><button class="btn quiet" id="rpP">${isRTL() ? '▶' : '◀'}</button><button class="btn primary" id="rpA">⏯</button><button class="btn quiet" id="rpN">${isRTL() ? '◀' : '▶'}</button><button class="btn quiet" id="rpE">⏭</button></div>`;
     const paint = () => {
       const f = frames[i];
       if (r.kind === 'bg') {
         const vpp = r.mode === 'local' || r.me == null ? 0 : r.me;
-        $('#rpB').innerHTML = BGX.svg(f.s, { vp: vpp, dice: f.d, diceSide: f.side === 'open' ? 'open' : (f.side === vpp ? 'me' : 'opp') });
+        $('#rpB').innerHTML = BGX.svg(f.s, { vp: vpp, variant: r.variant || 'short', dice: f.d, diceSide: f.side === 'open' ? 'open' : (f.side === vpp ? 'me' : 'opp') });
       } else $('#rpB').innerHTML = CKX.svg(f.b, { flip: r.me === 1, last: f.last });
       const endTxt = !r.result ? '' : r.result.w === 2 ? T('draw') : (r.mode !== 'local' && r.me != null) ? (r.result.w === r.me ? T('youWin') : r.mode === 'cpu' ? T('youLose') : T('win', { n: esc(r.names[r.result.w]) })) : T('win', { n: esc(r.names[r.result.w]) });
       $('#rpM').innerHTML = `${N(i + ' / ' + (frames.length - 1))}${i === frames.length - 1 && endTxt ? ' · ' + endTxt : ''}`;
