@@ -2,7 +2,7 @@
    per-file caching (allSettled), navigation network-first with a timeout,
    friendly offline page (never an error), skipWaiting, and clean copies of
    redirected responses (Cloudflare shortens .html URLs with a 308). */
-const VERSION = 'tavlanest-v3';
+const VERSION = 'tavlanest-v4';
 const CORE = ['./', 'index.html', 'manifest.json', 'privacy_policy.html', 'icon-192.png', 'icon-512.png'];
 
 const OFFLINE = `<!doctype html><html lang="he" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

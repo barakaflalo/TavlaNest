@@ -119,7 +119,7 @@ h1,h2,h3{font-family:var(--font-d);font-weight:400;margin:0;line-height:1.15}
 .msg{min-height:26px;text-align:center;font-weight:600;font-size:16px}
 .actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
 .actions .btn{flex:1 1 0;min-width:0;padding:10px 8px}
-.floatemo{position:absolute;font-size:42px;pointer-events:none;animation:emo 1.8s ease-out forwards;z-index:5}
+.floatemo{position:fixed;font-size:42px;pointer-events:none;animation:emo 1.8s ease-out forwards;z-index:70}
 @keyframes emo{0%{transform:translateY(10px) scale(.6);opacity:0}15%{transform:translateY(0) scale(1.15);opacity:1}100%{transform:translateY(-60px) scale(1);opacity:0}}
 .dragGhost{position:fixed;pointer-events:none;z-index:60;width:44px;height:44px;border-radius:50%;transform:translate(-50%,-80%);box-shadow:0 8px 16px rgba(0,0,0,.4)}
 
@@ -177,7 +177,7 @@ h1,h2,h3{font-family:var(--font-d);font-weight:400;margin:0;line-height:1.15}
 #game .strip{min-height:42px;padding:4px 10px}
 #game .strip .dot{width:18px;height:18px}
 #game .strip .nm{font-size:16px}
-.bubble{position:absolute;inset-inline-end:12px;top:-14px;background:var(--ink);color:var(--bg);padding:6px 12px;border-radius:14px;font-weight:700;font-size:15px;white-space:nowrap;pointer-events:none;animation:bub 2.6s ease-out forwards;z-index:5;max-width:80vw;overflow:hidden;text-overflow:ellipsis}
+.bubble{position:fixed;background:var(--ink);color:var(--bg);padding:6px 12px;border-radius:14px;font-weight:700;font-size:15px;white-space:nowrap;pointer-events:none;animation:bub 2.6s ease-out forwards;z-index:70;max-width:80vw;overflow:hidden;text-overflow:ellipsis}
 @keyframes bub{0%{opacity:0;transform:translateY(6px)}10%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0}}
 .phrases{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .phrases button{min-height:46px;border-radius:12px;border:1px solid var(--line);background:var(--surface2);font-weight:600;cursor:pointer;padding:6px}
@@ -207,7 +207,7 @@ h1,h2,h3{font-family:var(--font-d);font-weight:400;margin:0;line-height:1.15}
 <div id="app"></div>
 <script>
 /* =====================================================================
-   NestLink 1.0 — AppNest online multiplayer module (WebRTC via PeerJS)
+   NestLink 1.1 — AppNest online multiplayer module (WebRTC via PeerJS)
    One file, drop into any AppNest game. No server of our own:
    - a public PeerJS server only introduces the phones; game data, voice
      and voice messages then travel directly phone-to-phone.
@@ -216,6 +216,13 @@ h1,h2,h3{font-family:var(--font-d);font-weight:400;margin:0;line-height:1.15}
    - every game message is sequenced and re-sent after a reconnect.
    The game owns the session object (persist it with the game state) and
    receives events through callbacks. See NESTLINK.md for the API.
+   1.1: sendTo(seat, d) — a private message to one seat only (card games:
+        the host deals each player only their own cards). Compatible with 1.0.
+        Heartbeat: a phone that vanished (app closed, no signal) is marked offline
+        within ~10 s instead of looking connected forever.
+        After a reconnect, if the other side already got more messages than we
+        remember sending (we restored an older saved session), numbering continues
+        after theirs instead of being silently ignored.
    ===================================================================== */
 const NestLink = (() => {
   const CDNS = ['https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js', 'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js'];
@@ -229,7 +236,7 @@ const NestLink = (() => {
   const unb64 = s => { const b = atob(s), a = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; };
 
   function create(opt) {
-    const L = { status: 'off', lastErr: null, peer: null, conns: {}, retry: null, chunks: {}, calls: {}, audio: {}, mic: null, talking: false, openMic: false, rec: null };
+    const L = { status: 'off', lastErr: null, peer: null, conns: {}, retry: null, chunks: {}, calls: {}, audio: {}, mic: null, talking: false, openMic: false, rec: null, seen: {}, hb: {}, hbT: null };
     let S = null;                                         // the session — owned and persisted by the game
     const ev = (k, ...a) => { try { opt[k] && opt[k](...a); } catch (e) { console.error(e); } };
     const persist = () => ev('persist', S);
@@ -250,6 +257,7 @@ const NestLink = (() => {
     /* ---------- starting ---------- */
     async function start(session) {
       close(true); S = session; persist();
+      L.hbT = setInterval(beat, 3000);                   // after close(), which clears it
       setStatus('connecting');
       if (!(await loadPeer())) { setStatus('error', 'load'); return false; }
       const peer = L.peer = new Peer(isHost() ? roomId(S.code) : undefined, peerOpts());
@@ -283,11 +291,14 @@ const NestLink = (() => {
     function attach(c, seat) {
       let mySeat = seat;                                  // the seat at the other end of this connection
       const onOpen = () => {
-        if (!isHost()) { L.conns[0] = c; rawTo(0, { t: 'hi', cid: S.cid, name: opt.name ? opt.name() : '', have: link(0).lastIn, v: opt.version }); }
+        if (!isHost()) { L.conns[0] = c; rawTo(0, { t: 'hi', cid: S.cid, name: opt.name ? opt.name() : '', have: link(0).lastIn, v: opt.version, hb: 1 }); }
       };
       if (c.open) onOpen(); else c.on('open', onOpen);
       c.on('data', m => {
         if (!m || !m.t) return;
+        const key = isHost() ? mySeat : 0;                // 1.1 heartbeat: remember when we last heard from them
+        if (key != null) L.seen[key] = Date.now();
+        if (m.t === 'ping') { if (key != null) L.hb[key] = 1; return; }
         if (isHost() && m.t === 'hi') {                   // a guest introduces itself → give it a seat (same seat when it comes back)
           let p = S.roster.find(x => x.cid === m.cid);
           if (!p) {
@@ -297,16 +308,19 @@ const NestLink = (() => {
             ev('onJoin', s);
           }
           mySeat = p.seat; p.name = (m.name || '').slice(0, 20); p.online = true; p.pid = c.peer;
+          if ((m.have || 0) > link(mySeat).seq) link(mySeat).seq = m.have;   // 1.1: we restored an older session — keep numbering after what they already got
           if (L.conns[mySeat] && L.conns[mySeat] !== c) { try { L.conns[mySeat].close(); } catch (e) {} }
-          L.conns[mySeat] = c;
-          rawTo(mySeat, { t: 'hi', seat: mySeat, have: link(mySeat).lastIn, roster: S.roster, v: opt.version });
+          L.conns[mySeat] = c; L.seen[mySeat] = Date.now(); L.hb[mySeat] = m.hb ? 1 : 0;   // 1.1 phones announce the heartbeat
+          rawTo(mySeat, { t: 'hi', seat: mySeat, have: link(mySeat).lastIn, roster: S.roster, v: opt.version, hb: 1 });
           link(mySeat).out.filter(x => x.seq > (m.have || 0)).forEach(x => rawTo(mySeat, x));
           if (m.v && opt.version && m.v.split('.')[0] !== opt.version.split('.')[0]) ev('onVersion', m.v);
           persist(); broadcastRoster(); setStatus('open'); callEveryone();
           return;
         }
         if (!isHost() && m.t === 'hi') {
-          S.seat = m.seat; S.roster = m.roster || []; persist();
+          S.seat = m.seat; S.roster = m.roster || []; L.seen[0] = Date.now(); L.hb[0] = m.hb ? 1 : 0;
+          if ((m.have || 0) > link(0).seq) link(0).seq = m.have;            // 1.1: same protection on the guest side
+          persist();
           link(0).out.filter(x => x.seq > (m.have || 0)).forEach(x => rawTo(0, x));
           if (m.v && opt.version && m.v.split('.')[0] !== opt.version.split('.')[0]) ev('onVersion', m.v);
           clearTimeout(L.retry); setStatus('open'); ev('onRoster', S.roster); callEveryone(); return;
@@ -340,11 +354,11 @@ const NestLink = (() => {
       if (m.seq <= lk.lastIn) return;
       if (m.seq > lk.lastIn + 1) { rawTo(via, { t: 'need', have: lk.lastIn }); return; }
       lk.lastIn = m.seq; persist();
-      if (isHost() && max() > 2) for (const p of S.roster) if (p.seat !== 0 && p.seat !== m.from) seqTo(p.seat, m.d, m.from);
+      if (isHost() && max() > 2 && !m.p) for (const p of S.roster) if (p.seat !== 0 && p.seat !== m.from) seqTo(p.seat, m.d, m.from);
       ev('onMessage', m.d, m.from);
     }
-    function seqTo(seat, d, from) {
-      const lk = link(seat), m = { t: 'm', seq: ++lk.seq, from, d };
+    function seqTo(seat, d, from, priv) {
+      const lk = link(seat), m = { t: 'm', seq: ++lk.seq, from, d }; if (priv) m.p = 1;
       lk.out.push(m); if (lk.out.length > 300) lk.out.splice(0, lk.out.length - 300);
       rawTo(seat, m);
     }
@@ -352,6 +366,12 @@ const NestLink = (() => {
       if (!S) return;
       if (isHost()) { for (const p of S.roster) if (p.seat !== 0) seqTo(p.seat, d, 0); }
       else seqTo(0, d, S.seat);
+      persist();
+    }
+    function sendTo(seat, d) {                            // private: host → one guest, or guest → host only (not relayed)
+      if (!S || seat === S.seat) return;
+      if (isHost()) { if (S.roster.some(p => p.seat === seat)) seqTo(seat, d, 0, true); }
+      else seqTo(0, d, S.seat, true);
       persist();
     }
     function emoji(e) { if (S) rawAll({ t: 'emo', e, from: S.seat }); }
@@ -420,9 +440,26 @@ const NestLink = (() => {
       for (const k in L.chunks) if (Date.now() - L.chunks[k].t > 60000) delete L.chunks[k];
     }
 
+    /* ---------- 1.1 heartbeat ----------
+       A phone that closes the app or loses signal often never fires 'close'. Every 3 s we ping
+       everyone; a peer that pings (1.1+) but has been silent for 10 s is treated as gone.
+       Peers on 1.0 never ping, so they are never dropped by mistake. */
+    function beat() {
+      if (!S) return;
+      const now = Date.now();
+      for (const k in L.conns) {
+        const s = +k; rawTo(s, { t: 'ping' });
+        if (!L.hb[s] || now - (L.seen[s] || now) < 10000) continue;
+        L.hb[s] = 0; const c = L.conns[s]; delete L.conns[s]; try { c.close(); } catch (e) {}
+        stopAudioFrom(s);
+        if (isHost()) { const p = rosterEntry(s); if (p) p.online = false; persist(); broadcastRoster(); setStatus(Object.keys(L.conns).length ? 'open' : 'waiting'); }
+        else { setStatus('reconnecting'); scheduleRetry(); }
+      }
+    }
+
     /* ---------- closing ---------- */
     function close(keepSession) {
-      clearTimeout(L.retry);
+      clearTimeout(L.retry); clearInterval(L.hbT); L.hbT = null;
       Object.keys(L.audio).forEach(s => stopAudioFrom(+s));
       for (const s in L.conns) { try { L.conns[s].close(); } catch (e) {} }
       L.conns = {};
@@ -433,7 +470,7 @@ const NestLink = (() => {
     }
 
     return {
-      host, join, resume, close, send, emoji, isOpen, talk, setOpenMic, recStart, recStop,
+      host, join, resume, close, send, sendTo, emoji, isOpen, talk, setOpenMic, recStart, recStop,
       get status() { return L.status; }, get error() { return L.lastErr; }, get session() { return S; },
       get seat() { return S ? S.seat : null; }, get roster() { return S ? S.roster : []; },
       get micReady() { return !!L.mic; }, get talking() { return L.talking; }, get openMic() { return L.openMic; }, get recording() { return !!L.rec; },
@@ -1174,7 +1211,7 @@ if (typeof module !== 'undefined') module.exports = LN;
 /* =====================================================================
    TavlaNest — שש-בש ודמקה · AppNest
    ===================================================================== */
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const STORE_URL = 'https://appnest-store.pages.dev';
 const FEEDBACK = 'appnest55@gmail.com';
 
@@ -1197,7 +1234,7 @@ const saveGame = () => { if (G) store.set(K.game, G); else store.del(K.game); };
 /* ---------- i18n ---------- */
 const LANG = {
   he: {
-    appSub: 'שש-בש ודמקה', bg: 'שש-בש', bgLong: 'שש-בש קווקזי', bgShort: 'רגיל', bgLongShort: 'קווקזי (ארוך)', variant: 'סוג', headRule: 'רק כלי אחד יוצא מהראש בכל תור', boardStyle: 'סגנון לוח', bClassic: 'קלאסי', bWood: 'עץ', bContrast: 'ניגודיות', bTheme: 'כמו הערכה', oneTap: 'הזזה בלחיצה אחת כשיש רק מקום אחד', landscape: 'לוח ענק (טלפון שוכב)', portrait: 'חזרה לעמידה', luck: 'מד מזל', pipsRolled: 'סכום קוביות', doublesN: 'דאבלים', luckScore: 'מזל', luckNote: 'כמה הקוביות עזרו לעומת קובייה ממוצעת (חיובי = מזל טוב).', calc: 'מחשב…', analysis: 'ניתוח המשחק', accuracy: 'דיוק', bestMoves: 'מהלכים מצוינים', inacc: 'אי-דיוק', mistake: 'טעות', blunder: 'טעות גדולה', youPlayed: 'שיחקת', better: 'עדיף', noMistakes: 'לא נמצאו טעויות משמעותיות — משחק נקי! 👏', anlNote: 'המחשב בדק כל מהלך שלך מול המהלך הכי טוב לדעתו.', moveN: 'מהלך {n}', phrases: 'משפטים מהירים', puzzle: 'חידה יומית', puzzleSub: 'דמקה · מצא את המהלך המנצח', puzzleGoal: 'תורך — מצא את המהלך שזוכה בכלים', puzzleNext: 'עוד חידה', puzzleWrong: 'לא זה — נסה שוב', puzzleGood: 'נכון! המשך…', puzzleSolved: 'פתרת! 🎉', puzzleShow: 'הראה פתרון', puzzleStreak: 'רצף ימים: {n}', puzzleNum: 'חידה {n}', solvedN: 'פתרת {n} חידות', ck: 'דמקה', bgSub: 'רגיל או קווקזי (ארוך)', ckSub: 'קלאסית ישראלית או אנגלית',
+    appSub: 'שש-בש ודמקה', bg: 'שש-בש', bgLong: 'שש-בש קווקזי', bgShort: 'רגיל', bgLongShort: 'קווקזי (ארוך)', variant: 'סוג', headRule: 'רק כלי אחד יוצא מהראש בכל תור', subOn: '{n} התנתק — המחשב משחק במקומו עד שיחזור', subOff: '{n} חזר — ממשיכים כרגיל', subYou: 'המחשב משחק במקומך עד שהחיבור יחזור', boardStyle: 'סגנון לוח', bClassic: 'קלאסי', bWood: 'עץ', bContrast: 'ניגודיות', bTheme: 'כמו הערכה', oneTap: 'הזזה בלחיצה אחת כשיש רק מקום אחד', landscape: 'לוח ענק (טלפון שוכב)', portrait: 'חזרה לעמידה', luck: 'מד מזל', pipsRolled: 'סכום קוביות', doublesN: 'דאבלים', luckScore: 'מזל', luckNote: 'כמה הקוביות עזרו לעומת קובייה ממוצעת (חיובי = מזל טוב).', calc: 'מחשב…', analysis: 'ניתוח המשחק', accuracy: 'דיוק', bestMoves: 'מהלכים מצוינים', inacc: 'אי-דיוק', mistake: 'טעות', blunder: 'טעות גדולה', youPlayed: 'שיחקת', better: 'עדיף', noMistakes: 'לא נמצאו טעויות משמעותיות — משחק נקי! 👏', anlNote: 'המחשב בדק כל מהלך שלך מול המהלך הכי טוב לדעתו.', moveN: 'מהלך {n}', phrases: 'משפטים מהירים', puzzle: 'חידה יומית', puzzleSub: 'דמקה · מצא את המהלך המנצח', puzzleGoal: 'תורך — מצא את המהלך שזוכה בכלים', puzzleNext: 'עוד חידה', puzzleWrong: 'לא זה — נסה שוב', puzzleGood: 'נכון! המשך…', puzzleSolved: 'פתרת! 🎉', puzzleShow: 'הראה פתרון', puzzleStreak: 'רצף ימים: {n}', puzzleNum: 'חידה {n}', solvedN: 'פתרת {n} חידות', ck: 'דמקה', bgSub: 'רגיל או קווקזי (ארוך)', ckSub: 'קלאסית ישראלית או אנגלית',
     vsCpu: 'מול המחשב', local: 'שניים בטלפון אחד', online: 'אונליין עם חבר', level: 'רמה', easy: 'קל', medium: 'בינוני', hard: 'קשה', expert: 'מומחה',
     matchLen: 'אורך הסדרה', toPts: 'סדרה עד {n}', pt1: 'משחק בודד', turkish: 'מארס טורקי שווה 3', start: 'התחל', cancel: 'ביטול', close: 'סגור', ok: 'אישור', back: 'בית',
     rules: 'חוקים', rulesIl: 'ישראלית (מלכה עפה)', rulesEn: 'אנגלית (מלכה קצרה)', myColor: 'הצבע שלי', light: 'בהיר', dark: 'כהה', random: 'אקראי',
@@ -1230,7 +1267,7 @@ const LANG = {
     rulesTitleBg: 'חוקי שש-בש', rulesTitleCk: 'חוקי דמקה', cubeless: 'משחקים בלי קוביית הכפלה'
   },
   en: {
-    appSub: 'Backgammon & Checkers', bg: 'Backgammon', bgLong: 'Long Nardy', bgShort: 'Classic', bgLongShort: 'Long (Nardy)', variant: 'Variant', headRule: 'Only one checker may leave the head each turn', boardStyle: 'Board style', bClassic: 'Classic', bWood: 'Wood', bContrast: 'High contrast', bTheme: 'Match theme', oneTap: 'One-tap move when there is only one spot', landscape: 'Giant board (landscape)', portrait: 'Back to portrait', luck: 'Luck meter', pipsRolled: 'Pips rolled', doublesN: 'Doubles', luckScore: 'Luck', luckNote: 'How much the dice helped compared with an average roll (positive = lucky).', calc: 'Calculating…', analysis: 'Game analysis', accuracy: 'Accuracy', bestMoves: 'Best moves', inacc: 'Inaccuracy', mistake: 'Mistake', blunder: 'Blunder', youPlayed: 'You played', better: 'Better', noMistakes: 'No significant mistakes — a clean game! 👏', anlNote: 'The computer compared each of your moves with the move it thinks is best.', moveN: 'Move {n}', phrases: 'Quick phrases', puzzle: 'Daily puzzle', puzzleSub: 'Checkers · find the winning move', puzzleGoal: 'Your move — find the move that wins material', puzzleNext: 'Another puzzle', puzzleWrong: 'Not that one — try again', puzzleGood: 'Correct! Keep going…', puzzleSolved: 'Solved! 🎉', puzzleShow: 'Show solution', puzzleStreak: 'Day streak: {n}', puzzleNum: 'Puzzle {n}', solvedN: '{n} puzzles solved', ck: 'Checkers', bgSub: 'Classic or long (nardy)', ckSub: 'Israeli classic or English rules',
+    appSub: 'Backgammon & Checkers', bg: 'Backgammon', bgLong: 'Long Nardy', bgShort: 'Classic', bgLongShort: 'Long (Nardy)', variant: 'Variant', headRule: 'Only one checker may leave the head each turn', subOn: '{n} left — the computer plays for them until they return', subOff: '{n} is back — carrying on', subYou: 'The computer is playing for you until you reconnect', boardStyle: 'Board style', bClassic: 'Classic', bWood: 'Wood', bContrast: 'High contrast', bTheme: 'Match theme', oneTap: 'One-tap move when there is only one spot', landscape: 'Giant board (landscape)', portrait: 'Back to portrait', luck: 'Luck meter', pipsRolled: 'Pips rolled', doublesN: 'Doubles', luckScore: 'Luck', luckNote: 'How much the dice helped compared with an average roll (positive = lucky).', calc: 'Calculating…', analysis: 'Game analysis', accuracy: 'Accuracy', bestMoves: 'Best moves', inacc: 'Inaccuracy', mistake: 'Mistake', blunder: 'Blunder', youPlayed: 'You played', better: 'Better', noMistakes: 'No significant mistakes — a clean game! 👏', anlNote: 'The computer compared each of your moves with the move it thinks is best.', moveN: 'Move {n}', phrases: 'Quick phrases', puzzle: 'Daily puzzle', puzzleSub: 'Checkers · find the winning move', puzzleGoal: 'Your move — find the move that wins material', puzzleNext: 'Another puzzle', puzzleWrong: 'Not that one — try again', puzzleGood: 'Correct! Keep going…', puzzleSolved: 'Solved! 🎉', puzzleShow: 'Show solution', puzzleStreak: 'Day streak: {n}', puzzleNum: 'Puzzle {n}', solvedN: '{n} puzzles solved', ck: 'Checkers', bgSub: 'Classic or long (nardy)', ckSub: 'Israeli classic or English rules',
     vsCpu: 'vs Computer', local: 'Two on one phone', online: 'Online with a friend', level: 'Level', easy: 'Easy', medium: 'Medium', hard: 'Hard', expert: 'Expert',
     matchLen: 'Match length', toPts: 'To {n}', pt1: 'Single game', turkish: 'Turkish mars counts 3', start: 'Start', cancel: 'Cancel', close: 'Close', ok: 'OK', back: 'Home',
     rules: 'Rules', rulesIl: 'Israeli (flying king)', rulesEn: 'English (short king)', myColor: 'My color', light: 'Light', dark: 'Dark', random: 'Random',
@@ -1509,8 +1546,12 @@ const GS = {
   emoji(seatIsTop, e) {
     const host = $('#' + (seatIsTop ? 'stripTop' : 'stripBot')); if (!host) return;
     const isText = /[\s\u0590-\u05FFA-Za-z]/.test(e);
-    const f = h(isText ? `<div class="bubble">${esc(e)}</div>` : `<div class="floatemo" style="inset-inline-end:16px;top:-10px">${esc(e)}</div>`);
-    host.appendChild(f); setTimeout(() => f.remove(), isText ? 2700 : 1900);
+    const f = h(isText ? `<div class="bubble">${esc(e)}</div>` : `<div class="floatemo">${esc(e)}</div>`);
+    // fixed layer above everything: a bubble inside a strip can be clipped or covered by the board
+    const r = host.getBoundingClientRect();
+    f.style.top = Math.max(4, r.top - (isText ? 20 : 30)) + 'px';
+    if (isRTL()) f.style.right = Math.max(6, innerWidth - r.right + 14) + 'px'; else f.style.left = Math.max(6, r.left + 14) + 'px';
+    document.body.appendChild(f); setTimeout(() => f.remove(), isText ? 2700 : 1900);
   },
   svgPoint(svg, ev) { const p = svg.createSVGPoint(); p.x = ev.clientX; p.y = ev.clientY; const m = svg.getScreenCTM(); return m ? p.matrixTransform(m.inverse()) : { x: 0, y: 0 }; }
 };
@@ -1521,7 +1562,12 @@ async function toggleLandscape() {
     try { await screen.orientation.lock('landscape'); } catch (e) { toast('🔄'); }
   } catch (e) { toast('🔄'); }
 }
-function controllerOf(pl) { if (G.mode === 'local') return 'human'; if (G.mode === 'cpu') return pl === G.me ? 'human' : 'cpu'; return pl === G.me ? 'human' : 'remote'; }
+function controllerOf(pl) {
+  if (G.mode === 'local') return 'human'; if (G.mode === 'cpu') return pl === G.me ? 'human' : 'cpu';
+  // online: while the friend is away the host's phone plays their side ("subbed"); the friend's phone just watches
+  if (pl === G.me) return (G.subbed && !NET.isHost()) ? 'remote' : 'human';
+  return (G.subbed && NET.isHost()) ? 'cpu' : 'remote';
+}
 
 function gameMenu() {
   const items = [];
@@ -1677,7 +1723,7 @@ const BGX = (() => {
     }
     if (G.lastTrail && G.phase !== 'move') o.trail = G.lastTrail;
     box.innerHTML = svg(G.s, o);
-    strips(); actions(); message();
+    strips(); actions(); message(); if (G.mode === 'online') NET.paintStatus();
     if (opt.anim) animate(opt.anim);
   }
   function strips() {
@@ -1761,6 +1807,7 @@ const BGX = (() => {
     bindBoard(); render(); proceed();
   }
   function proceed() {
+    if (G.mode === 'online' && NET.isHost()) NET.checkUnsub();
     const id = run, pl = G.turn, ctl = controllerOf(pl);
     if (G.phase === 'opening') { if (G.mode !== 'online' || NET.isHost()) doOpening(id); return; }
     if (G.phase === 'roll') { if (ctl === 'cpu') cpuTurn(id); else if (ctl === 'human' && ST.autoRoll) setTimeout(() => { if (alive(id) && G.phase === 'roll') humanRoll(); }, 450); return; }
@@ -1815,7 +1862,7 @@ const BGX = (() => {
   async function cpuPlay(id) {
     if (G.need === 0) { await wait(1300); if (!alive(id)) return; return commit(); }
     await wait(350); if (!alive(id)) return;
-    const ch = E().choose(G.s, G.turn, G.dice[0], G.dice[1], G.level);
+    const ch = E().choose(G.s, G.turn, G.dice[0], G.dice[1], G.level || 'hard');
     for (const m of ch.moves) {
       await wait(430); if (!alive(id)) return;
       doStep({ from: m[0], die: m[3], to: m[1], hit: m[2] });
@@ -1865,6 +1912,7 @@ const BGX = (() => {
   }
   function commitHuman() { if (controllerOf(G.turn) !== 'human') return; if (G.mode === 'online') NET.send({ type: 'turn', d: G.dice, m: G.tm.map(x => [x.from, x.die]), h: hashState(G.s) }); commit(); }
   function commit() {
+    if (G.mode === 'online' && G.subbed && NET.isHost() && controllerOf(G.turn) === 'cpu') NET.send({ type: 'turn', d: G.dice, m: G.tm.map(x => [x.from, x.die]), h: hashState(G.s), sub: 1 });
     G.rec.turns.push({ p: G.turn, d: G.dice.slice(), m: G.tm.map(x => [x.from, x.die]) });
     G.lastTrail = G.tm.map(x => [toView(x.from, G.turn), toView(x.to, G.turn)]);
     const w = E().winner(G.s);
@@ -2026,9 +2074,10 @@ const BGX = (() => {
     }
     if (m.type === 'turn') {
       if (controllerOf(G.turn) !== 'remote') return;
-      if (G.phase === 'roll' || !G.start) { G.start = E().clone(G.s); const info = E().turnInfo(G.s, G.turn, m.d[0], m.d[1]); G.headLimit = info.headLimit || 1; G.dice = m.d; G.need = info.need; G.onlyDie = info.onlyDie; }
+      if (G.phase === 'roll' || !G.start) G.start = E().clone(G.s);
+      { const info = E().turnInfo(G.start, G.turn, m.d[0], m.d[1]); G.headLimit = info.headLimit || 1; G.dice = m.d; G.need = info.need; G.onlyDie = info.onlyDie; }
       G.tm = m.m.map(([from, die]) => ({ from, die })); replayTurn();
-      if (m.h && hashState(G.s) !== m.h) { NET.send({ type: 'needstate' }); return; }
+      if (m.h && hashState(G.s) !== m.h) { if (NET.isHost()) NET.send({ type: 'state', g: snapshot() }); else NET.send({ type: 'needstate' }); return; }   // the host's board wins
       commit(); return;
     }
     if (m.type === 'resign') { run++; gameOver(G.me, E().winType(G.s, G.me, G.turkish), true); return; }
@@ -2036,7 +2085,7 @@ const BGX = (() => {
     if (m.type === 'needstate') { NET.send({ type: 'state', g: snapshot() }); return; }
     if (m.type === 'state') { Object.assign(G, m.g); sel = null; targets = null; run++; saveGame(); render(); proceed(); return; }
   }
-  function snapshot() { const g = {}; for (const k of ['score', 'gameNo', 'phase', 's', 'turn', 'dice', 'rem', 'need', 'onlyDie', 'headLimit', 'start', 'tm', 'rec', 'result']) g[k] = JSON.parse(JSON.stringify(G[k] == null ? null : G[k])); return g; }
+  function snapshot() { const g = {}; for (const k of ['score', 'gameNo', 'phase', 's', 'turn', 'dice', 'rem', 'need', 'onlyDie', 'headLimit', 'start', 'tm', 'rec', 'result', 'subbed', 'ep']) g[k] = JSON.parse(JSON.stringify(G[k] == null ? null : G[k])); return g; }
 
   return { create, open, render, onNet, svg, resign, stopTimers, proceed, get sel() { return sel; } };
 })();
@@ -2103,7 +2152,7 @@ const CKX = (() => {
       if (sel != null) { o.sel = sel; o.part = part; o.next = nextSquares(ms); }
     }
     box.innerHTML = svg(G.st.b, o);
-    strips(); actions(); message(opt.msg);
+    strips(); actions(); message(opt.msg); if (G.mode === 'online') NET.paintStatus();
     if (opt.anim) animate(opt.anim, fl);
   }
   function nextSquares(ms) { const k = part.length; return [...new Set(ms.filter(m => prefix(m, part) && m.path.length > k).map(m => m.path[k]))]; }
@@ -2166,7 +2215,7 @@ const CKX = (() => {
   async function cpuMove(id) {
     render(); await wait(450); if (!alive(id)) return;
     await new Promise(r => setTimeout(r, 30));                         // let the "thinking" message paint
-    const mv = AI.choose(G.st, G.rules, G.level); if (!alive(id) || !mv) return;
+    const mv = AI.choose(G.st, G.rules, G.level || 'hard'); if (!alive(id) || !mv || controllerOf(G.st.turn) !== 'cpu') return;
     play(mv);
   }
   function play(mv, fromNet) {
@@ -2175,7 +2224,8 @@ const CKX = (() => {
     G.st = CK.play(G.st, mv, G.rules); G.moves.push(mv.path.slice()); G.last = { path: mv.path.slice(), cap: mv.cap.slice() };
     sel = null; part = null; hintMv = null;
     snd(mv.cap.length ? 'hit' : 'move'); if (mv.cap.length) vib(20);
-    if (G.mode === 'online' && !fromNet) NET.send({ type: 'move', path: mv.path });
+    if (G.mode === 'online' && !fromNet) NET.send({ type: 'move', path: mv.path, sub: G.subbed && NET.isHost() && controllerOf(pl) === 'cpu' ? 1 : 0 });
+    if (G.mode === 'online' && NET.isHost()) NET.checkUnsub(G.st.turn);
     saveGame();
     render({ anim: { path: mv.path, to: mv.path[mv.path.length - 1] }, poof: mv.cap.map(s => ({ s, v: before[s] })) });
     const r = CK.result(G.st, G.rules);
@@ -2295,9 +2345,10 @@ const CKX = (() => {
   /* ---------- online ---------- */
   function onNet(m) {
     if (m.type === 'move') {
-      if (G.phase !== 'move' || controllerOf(G.st.turn) !== 'remote') { NET.send({ type: 'needstate' }); return; }
+      const resync = () => NET.isHost() ? NET.send({ type: 'state', g: ckSnap() }) : NET.send({ type: 'needstate' });   // the host's board wins
+      if (G.phase !== 'move' || controllerOf(G.st.turn) !== 'remote') { resync(); return; }
       const mv = legal().find(x => x.path.length === m.path.length && x.path.every((s, i) => s === m.path[i]));
-      if (!mv) { NET.send({ type: 'needstate' }); return; }
+      if (!mv) { resync(); return; }
       play(mv, true); return;
     }
     if (m.type === 'resign') { run++; gameOver(G.me, 'resign'); return; }
@@ -2309,10 +2360,11 @@ const CKX = (() => {
     }
     if (m.type === 'drawans') { if (m.ok && G.phase === 'move') { run++; gameOver(2, 'agreed'); } else if (!m.ok) toast(T('drawDeclined')); return; }
     if (m.type === 'next') { if (G.phase === 'over') rematch(true); return; }
-    if (m.type === 'needstate') { NET.send({ type: 'state', g: { gameNo: G.gameNo, st: G.st, phase: G.phase, moves: G.moves, last: G.last, result: G.result, wins: G.wins } }); return; }
+    if (m.type === 'needstate') { NET.send({ type: 'state', g: ckSnap() }); return; }
     if (m.type === 'state') { Object.assign(G, m.g); G.me = seatOf(NET.isHost() ? 0 : 1); sel = null; part = null; run++; saveGame(); render(); proceed(); return; }
   }
 
+  function ckSnap() { return { gameNo: G.gameNo, st: G.st, phase: G.phase, moves: G.moves, last: G.last, result: G.result, wins: G.wins, subbed: !!G.subbed, ep: G.ep || 0 }; }
   return { create, open, render, svg, onNet, resign, offerDraw, proceed, nameOf };
 })();
 window.CKX = CKX;
@@ -2332,7 +2384,7 @@ const NET = (() => {
       onStatus: (st, err) => { status = st; paintStatus(); if (st === 'error' && err === 'load') toast(T('loadFail'), 4000); },
       onCode: () => { if (CUR === 'lobby') showLobby(); },
       onJoin: seat => { sendSetup(); },
-      onRoster: roster => { syncNames(roster); paintStatus(); repaintStrips(); },
+      onRoster: roster => { syncNames(roster); paintStatus(); repaintStrips(); watchFriend(); },
       onMessage: (m, from) => onMessage(m, from),
       onEmoji: (e, seat) => { GS.emoji(seat !== mySeat(), e); snd('ping'); },
       onTalk: () => repaintStrips(),
@@ -2364,7 +2416,8 @@ const NET = (() => {
     const nb = $('#netbar'); if (!nb || !G || G.mode !== 'online') return;
     const other = LINK && LINK.roster.find(p => p.seat !== mySeat());
     let txt = '', bad = false;
-    if (status === 'open' && other && other.online === false) { txt = T('friendOffline', { n: esc(other.name || T('friend')) }); bad = true; }
+    if (G.subbed && G.kind && !['over', 'matchover'].includes(G.phase)) txt = '🤖 ' + (isHost() ? T('subOn', { n: esc(otherName()) }) : T('subYou'));
+    else if (status === 'open' && other && other.online === false) { txt = T('friendOffline', { n: esc(other.name || T('friend')) }); bad = true; }
     else if (status !== 'open') { txt = T('st_' + status); bad = status !== 'connecting'; }
     nb.classList.toggle('hidden', !txt); nb.classList.toggle('bad', bad); nb.innerHTML = txt;
   }
@@ -2398,8 +2451,46 @@ const NET = (() => {
       openGame();
     }
   }
+  /* ---------- stand-in computer: friend gone 30 s → the host's phone plays their side until they're back ---------- */
+  const SUB_MS = 30000; let subT = null;
+  const GAMEMSG = { roll: 1, steps: 1, turn: 1, move: 1, resign: 1, drawoffer: 1, drawans: 1, next: 1 };
+  const guestEntry = () => LINK && LINK.roster.find(p => p.seat === 1);
+  const gameActive = () => G && G.mode === 'online' && G.kind && !['lobby', 'over', 'matchover'].includes(G.phase);
+  const kick = () => { if (CUR === 'game' && G && G.kind) { const X = G.kind === 'bg' ? BGX : CKX; X.render(); X.proceed(); } };
+  function watchFriend() {
+    if (!isHost() || !G || G.mode !== 'online') return;
+    const g = guestEntry(), away = !!g && g.online === false;
+    if (away && gameActive() && !G.subbed) { if (!subT) subT = setTimeout(startSub, SUB_MS); }
+    else { clearTimeout(subT); subT = null; }
+    if (!away && G.subbed) checkUnsub();
+  }
+  function startSub() {
+    subT = null; const g = guestEntry();
+    if (!g || g.online !== false || !gameActive() || G.subbed) return;
+    G.subbed = true; G.ep = (G.ep || 0) + 1; saveGame();
+    LINK.send({ type: 'sub', on: 1, ep: G.ep });
+    toast('🤖 ' + T('subOn', { n: esc(otherName()) }), 4000); kick();
+  }
+  // hand the seat back — backgammon waits for the computer to finish the friend's turn, checkers can switch any time
+  function checkUnsub() {
+    if (!isHost() || !G || !G.subbed) return;
+    const g = guestEntry(); if (!g || g.online === false) return;
+    if (G.kind === 'bg' && !['over', 'matchover', 'opening'].includes(G.phase) && G.turn !== G.me) return;
+    G.subbed = false; saveGame();
+    LINK.send({ type: 'sub', on: 0, ep: G.ep });
+    toast(T('subOff', { n: esc(otherName()) }), 3000);
+    if (CUR === 'game') (G.kind === 'bg' ? BGX : CKX).render();
+  }
   function onMessage(m, from) {
     if (!m || !m.type) return;
+    // the host ignores the friend's moves from before the computer took over (they arrive late, after reconnecting)
+    if (isHost() && G && GAMEMSG[m.type] && (m.ep || 0) < (G.ep || 0)) return;
+    if (m.type === 'sub') {
+      if (isHost() || !G) return;
+      G.subbed = !!m.on; G.ep = Math.max(G.ep || 0, m.ep || 0); saveGame();
+      if (CUR === 'game' && G.kind) { const X = G.kind === 'bg' ? BGX : CKX; X.render(); if (!m.on) X.proceed(); }
+      return;
+    }
     if (m.type === 'setup') {
       if (isHost()) return;
       const net = G && G.net || { role: 'guest' };
@@ -2413,7 +2504,7 @@ const NET = (() => {
     if (G.kind === 'bg') BGX.onNet(m); else CKX.onNet(m);
   }
   const otherName = () => { const p = LINK && LINK.roster.find(x => x.seat !== mySeat()); return (p && p.name) || T('friend'); };
-  function send(m) { if (LINK && G && G.mode === 'online') LINK.send(m); }
+  function send(m) { if (LINK && G && G.mode === 'online') { m.ep = G.ep || 0; LINK.send(m); } }
   function leave() { if (LINK) { try { LINK.send({ type: 'bye' }); } catch (e) {} setTimeout(() => { if (LINK) LINK.close(); }, 300); } G = null; saveGame(); }
   function leaveQuiet() { if (LINK && LINK.status !== 'off') LINK.close(); }
 
@@ -2453,7 +2544,7 @@ const NET = (() => {
     if (!mine) { snd('ping'); a.play().catch(() => toast(T('tapToHear'))); }
   }
 
-  return { make, host, join, ensure, send, leave, leaveQuiet, renderDock, rosterFor, isHost, paintStatus, get link() { return LINK; }, get status() { return status; } };
+  return { checkUnsub, make, host, join, ensure, send, leave, leaveQuiet, renderDock, rosterFor, isHost, paintStatus, get link() { return LINK; }, get status() { return status; } };
 })();
 const PHRASES = {
   he: ['יאללה תזרוק 🎲', 'איזה מזל! 🍀', 'מהלך יפה 👏', 'שנייה, חושב 🤔', 'לא הוגן! 😤', 'חחח 😂', 'עוד משחק? 🔁', 'בהצלחה 🙂'],
